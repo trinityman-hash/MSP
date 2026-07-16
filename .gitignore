@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# C/C++ build
+build/
+build-*/
+*.o
+*.a
+*.so
+
+# CUDA
+*.ptx
+*.cubin
+
+# Editor/OS
+.vscode/
+.idea/
+.DS_Store
+
+# Local artifacts
+*.log
