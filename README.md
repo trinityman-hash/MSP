@@ -23,9 +23,11 @@ of the threat model this repo does and does not cover.
 ```
 src/python/msp/    Reference implementation (PyTorch) — portable,
                     CPU-testable, the source of truth for behavior.
-src/cpp/            EloraAllocator: adapter-scoped KV-cache allocator.
+                    Also where msp_native (see below) gets built into.
+src/cpp/            EloraAllocator (KV-cache allocator) + bindings.cpp
+                    (pybind11 module wiring it into Python as msp_native).
 src/cuda/           NVIDIA CUDA kernel for on-device gradient compute.
-src/daemon/         C watchdog + SHA-256 integrity-check daemon.
+src/daemon/         C watchdog + SHA-256/Ed25519 integrity-check daemon.
 tests/              Mirrors src/. Python via pytest; C/C++ via plain
                     executables run through ctest.
 docs/               Architecture, status, and security notes.
@@ -67,6 +69,14 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
+This also builds `msp_native` (a pybind11 extension wiring `EloraAllocator`
+into `AdapterManager`, dropped directly into `src/python/msp/`) as long as
+`pybind11` is installed (`pip install pybind11`, or just `pip install -r
+requirements.txt`). Without it, `AdapterManager` still works — it falls
+back to pure-Python byte-count tracking. Check `AdapterManager().native_backed`
+to see which mode you're in. Disable it explicitly with
+`cmake -B build -DMSP_BUILD_PYTHON_BINDINGS=OFF`.
+
 To build the KV-cache allocator against the real CUDA runtime (requires
 the NVIDIA CUDA toolkit) instead of the portable host-allocation fallback:
 
@@ -77,9 +87,10 @@ cmake -B build -DMSP_USE_CUDA=ON
 ## What's verified vs. what isn't
 
 - **Verified in this environment:** the full Python package (pytest), the
-  C++ allocator and C daemon/integrity-check code (built and tested via
-  CMake/ctest, and re-run clean under AddressSanitizer +
-  UndefinedBehaviorSanitizer).
+  C++ allocator, the pybind11 binding wiring it into Python, and the C
+  daemon/integrity-check code (Ed25519 signing included) — built and
+  tested via CMake/ctest, and re-run clean under AddressSanitizer +
+  UndefinedBehaviorSanitizer.
 - **Not verified here:** `src/cuda/fused_msp_backward_kernel.cu` — this
   development environment has no NVIDIA GPU or CUDA toolkit. The kernel
   has been reviewed for correctness and syntax but not compiled or
