@@ -33,21 +33,32 @@ this repo does and does not protect against today.
 If adapters are meant to be purchased/licensed from third parties (as the
 v2 doc's "AI Parts marketplace" describes), a device needs to verify an
 adapter was published by whoever it claims to be from, not just that its
-bytes weren't corrupted. That needs:
+bytes weren't corrupted.
 
-- A signature scheme (Ed25519 recommended over RSA for this: smaller
-  signatures, faster verification, less error-prone implementation) over
-  the SHA-256 digest already computed by `integrity_check.c`.
-- A trust root: either an embedded public key per publisher, a
-  certificate chain, or a remote attestation/revocation service.
-- A decision about revocation: what happens to an adapter already resident
-  on-device if its signing key is later revoked?
+**The cryptographic primitive for this is now implemented**:
+`msp_ed25519_sign()` / `msp_verify_signature()` in `integrity_check.c`
+sign and verify Ed25519 signatures over the SHA-256 digest already
+computed by `integrity_check.c`'s integrity half. Ed25519 was chosen over
+RSA for the reasons above (fixed-size keys/signatures, no padding-scheme
+footguns, constant-time by construction). This has known-answer,
+round-trip, and tamper-detection tests in `tests/daemon/test_integrity_check.c`.
 
-`msp_verify_signature_STUB()` in `integrity_check.h` is a deliberately
-unimplemented placeholder with the right function shape for this — it
-returns `false` unconditionally so nothing accidentally treats an
-unimplemented check as a passed one. None of the trust-root decisions
-above are made in this repo; they're deployment-specific.
+**What's still a deployment decision, not implemented here:**
+
+- A trust root: how a verifier obtains and trusts a specific public key
+  in the first place -- an embedded key per publisher, a certificate
+  chain, or a remote attestation/revocation service.
+- Key management for the *signing* side: `msp_ed25519_generate_keypair()`
+  exists for tests/local development only; a real publisher's signing key
+  needs proper generation, storage, and access-control practices this
+  repo has no opinion on.
+- Revocation: what happens to an adapter already resident on-device if
+  its signing key is later revoked?
+
+In short: the "can I verify this specific signature against this specific
+key" question is answered. The "should I trust this key" question is not,
+and depends on decisions (PKI vs. embedded keys vs. attestation) that
+belong to whoever operates the marketplace.
 
 ### Isolation of untrusted adapter code/weights
 
