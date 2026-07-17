@@ -10,15 +10,24 @@
 //
 //   - AUTHENTICITY ("did this data really come from a trusted publisher,
 //     e.g. the B2B adapter marketplace?") is answered by a SIGNATURE
-//     scheme (RSA-PSS or, preferably, Ed25519) applied *to* a hash of the
-//     data. This is a separate, optional step -- msp_verify_signature()
-//     is provided as a stub with the correct shape, since wiring up a
-//     real signing/trust-root workflow is a deployment-specific decision
-//     (key management, revocation, etc.) outside the scope of this fix.
+//     scheme applied *to* a hash of the data.
 //
-// This module implements the hash/integrity half concretely (via
-// OpenSSL's EVP SHA-256), and documents the signature half so it's built
-// correctly if/when a trust root is available.
+// This module implements BOTH halves concretely via OpenSSL:
+//   - SHA-256 for integrity (msp_sha256 / msp_verify_integrity).
+//   - Ed25519 for authenticity (msp_ed25519_sign / msp_verify_signature),
+//     chosen over RSA per the tradeoffs in docs/SECURITY.md: fixed
+//     64-byte signatures, fixed 32-byte keys, and an implementation with
+//     far fewer footguns than RSA (no padding-scheme choices to get
+//     wrong, constant-time by construction).
+//
+// WHAT THIS DOES NOT DECIDE: where a verifier gets a public key it should
+// actually trust (an embedded key vs. a certificate chain vs. a remote
+// attestation/revocation service), or how key rotation/revocation works.
+// Those are deployment-specific trust-root decisions -- see
+// docs/SECURITY.md. msp_verify_signature() below takes the public key as
+// a parameter precisely so the caller supplies it however their trust
+// model dictates; this module only implements the cryptographic
+// operation once you have one.
 
 #ifndef MSP_INTEGRITY_CHECK_H
 #define MSP_INTEGRITY_CHECK_H
@@ -49,16 +58,39 @@ bool msp_digest_equal(const uint8_t a[MSP_SHA256_DIGEST_LEN],
 bool msp_verify_integrity(const uint8_t* data, size_t len,
                            const uint8_t expected_digest[MSP_SHA256_DIGEST_LEN]);
 
-// NOT IMPLEMENTED: signature verification (authenticity). Wiring this up
-// requires a decision about the trust root (embedded public key vs. a
-// certificate chain vs. a remote attestation service) that belongs to
-// deployment configuration, not this library. Left as a documented stub
-// so the correct primitive (a signature over the SHA-256 digest, verified
-// with e.g. RSA-PSS or Ed25519) is the one that gets filled in here,
-// rather than an ad hoc "RSA hash."
-bool msp_verify_signature_STUB(const uint8_t digest[MSP_SHA256_DIGEST_LEN],
-                                const uint8_t* signature, size_t sig_len,
-                                const uint8_t* public_key, size_t key_len);
+// ---------------------------------------------------------------------
+// Authenticity (Ed25519). Fixed-size raw keys/signatures -- no ASN.1, no
+// padding scheme to choose, matching Ed25519's usual (and recommended)
+// raw-bytes usage.
+// ---------------------------------------------------------------------
+
+#define MSP_ED25519_PUBKEY_LEN 32
+#define MSP_ED25519_PRIVKEY_LEN 32
+#define MSP_ED25519_SIGNATURE_LEN 64
+
+// Generates a new Ed25519 keypair. Intended for tests and local
+// development -- a real deployment's signing key belongs to whoever
+// publishes adapters (the B2B marketplace side), generated and stored
+// with proper key-management practices well outside what a header-only
+// helper like this should be trusted for.
+bool msp_ed25519_generate_keypair(uint8_t out_public_key[MSP_ED25519_PUBKEY_LEN],
+                                   uint8_t out_private_key[MSP_ED25519_PRIVKEY_LEN]);
+
+// Signs `digest` (typically the output of msp_sha256 over an adapter's
+// bytes) with the given private key.
+bool msp_ed25519_sign(const uint8_t private_key[MSP_ED25519_PRIVKEY_LEN],
+                       const uint8_t digest[MSP_SHA256_DIGEST_LEN],
+                       uint8_t out_signature[MSP_ED25519_SIGNATURE_LEN]);
+
+// Verifies that `signature` is a valid Ed25519 signature over `digest`
+// under `public_key`. This answers "did the holder of the private key
+// matching this specific public key sign this exact digest" -- it does
+// NOT answer "should I trust this public key in the first place." That
+// second question is the trust-root decision documented in
+// docs/SECURITY.md and is the caller's responsibility.
+bool msp_verify_signature(const uint8_t digest[MSP_SHA256_DIGEST_LEN],
+                           const uint8_t signature[MSP_ED25519_SIGNATURE_LEN],
+                           const uint8_t public_key[MSP_ED25519_PUBKEY_LEN]);
 
 #ifdef __cplusplus
 }
