@@ -12,6 +12,7 @@ v3.0 specification.
 from .plugin_layer import StructuralPluginLayer
 from .adapter_manager import AdapterManager, AdapterBudgetError
 from .thermal import ThermalMonitor, ThermalReading
+from .persistence import save_adapter, load_adapter
 
 __all__ = [
     "StructuralPluginLayer",
@@ -19,6 +20,8 @@ __all__ = [
     "AdapterBudgetError",
     "ThermalMonitor",
     "ThermalReading",
+    "save_adapter",
+    "load_adapter",
 ]
 
 __version__ = "0.1.0"
