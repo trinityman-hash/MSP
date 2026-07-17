@@ -50,8 +50,40 @@ int main(void) {
     CHECK(msp_verify_integrity((const uint8_t*)original, strlen(original), d1));
     CHECK(!msp_verify_integrity((const uint8_t*)tampered, strlen(tampered), d1));
 
-    // Unimplemented signature check must fail safe (never silently pass).
-    CHECK(msp_verify_signature_STUB(d1, NULL, 0, NULL, 0) == false);
+    // --- Ed25519 signature (authenticity) tests ---
+
+    uint8_t pub_key[MSP_ED25519_PUBKEY_LEN];
+    uint8_t priv_key[MSP_ED25519_PRIVKEY_LEN];
+    CHECK(msp_ed25519_generate_keypair(pub_key, priv_key));
+
+    uint8_t signature[MSP_ED25519_SIGNATURE_LEN];
+    CHECK(msp_ed25519_sign(priv_key, d1, signature));
+
+    // Valid signature over the digest it was actually signed for, with
+    // the matching public key, must verify.
+    CHECK(msp_verify_signature(d1, signature, pub_key));
+
+    // A signature must NOT verify against a different digest (someone
+    // swapped the payload after signing).
+    CHECK(!msp_verify_signature(d2, signature, pub_key));
+
+    // A signature must NOT verify against a different (unrelated) public
+    // key (someone claims a different signer).
+    uint8_t other_pub[MSP_ED25519_PUBKEY_LEN];
+    uint8_t other_priv[MSP_ED25519_PRIVKEY_LEN];
+    CHECK(msp_ed25519_generate_keypair(other_pub, other_priv));
+    CHECK(!msp_verify_signature(d1, signature, other_pub));
+
+    // Flipping a single bit of a valid signature must invalidate it.
+    uint8_t corrupted_signature[MSP_ED25519_SIGNATURE_LEN];
+    memcpy(corrupted_signature, signature, MSP_ED25519_SIGNATURE_LEN);
+    corrupted_signature[0] ^= 0x01;
+    CHECK(!msp_verify_signature(d1, corrupted_signature, pub_key));
+
+    // Two keypairs generated back-to-back must not be identical (sanity
+    // check that keygen is actually randomized, not returning a fixed
+    // "test" key).
+    CHECK(memcmp(pub_key, other_pub, MSP_ED25519_PUBKEY_LEN) != 0);
 
     printf("All integrity_check tests passed.\n");
     return 0;
