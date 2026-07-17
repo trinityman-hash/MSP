@@ -6,8 +6,15 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+# Required so elora_allocator (a static lib) can be linked into
+# msp_native.so (a shared object) below -- without this, static libs are
+# compiled without -fPIC by default and the link fails with "relocation
+# R_X86_64_PC32 ... can not be used when making a shared object".
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 option(MSP_USE_CUDA "Build EloraAllocator against the CUDA runtime (requires NVIDIA toolkit)" OFF)
 option(MSP_BUILD_TESTS "Build the standalone C/C++ tests" ON)
+option(MSP_BUILD_PYTHON_BINDINGS "Build the pybind11 extension wiring EloraAllocator into Python" ON)
 
 find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
@@ -25,6 +32,35 @@ if(MSP_USE_CUDA)
     find_package(CUDAToolkit REQUIRED)
     target_compile_definitions(elora_allocator PUBLIC USE_CUDA)
     target_link_libraries(elora_allocator PUBLIC CUDA::cudart)
+endif()
+
+# ---------------------------------------------------------------------------
+# Python bindings (pybind11) -- wires EloraAllocator into src/python/msp
+# ---------------------------------------------------------------------------
+if(MSP_BUILD_PYTHON_BINDINGS)
+    find_package(Python3 COMPONENTS Interpreter Development QUIET)
+    execute_process(
+        COMMAND "${Python3_EXECUTABLE}" -m pybind11 --cmakedir
+        OUTPUT_VARIABLE pybind11_DIR
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE PYBIND11_CMAKEDIR_RESULT
+    )
+    if(Python3_FOUND AND PYBIND11_CMAKEDIR_RESULT EQUAL 0)
+        find_package(pybind11 CONFIG QUIET)
+    endif()
+    if(pybind11_FOUND)
+        pybind11_add_module(msp_native src/cpp/bindings.cpp)
+        target_link_libraries(msp_native PRIVATE elora_allocator)
+        # Drop the compiled extension directly into src/python/msp/ so
+        # `import msp_native` works from a normal PYTHONPATH=src/python
+        # run without any extra install step.
+        set_target_properties(msp_native PROPERTIES
+            LIBRARY_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/src/python/msp"
+        )
+    else()
+        message(STATUS "pybind11 not found -- skipping msp_native extension "
+                        "(AdapterManager will fall back to pure-Python byte tracking)")
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
