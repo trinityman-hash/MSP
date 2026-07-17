@@ -11,15 +11,15 @@ model, see [`SECURITY.md`](SECURITY.md).
 | Component | Status | Tested how | Notes |
 |---|---|---|---|
 | `StructuralPluginLayer` (Python) | Done | 12 pytest cases | Core LoRA adapter, gate, device/dtype-aware |
-| `AdapterManager` (Python) | Done | 7 pytest cases | Memory-budget enforcement, hot-swap |
+| `AdapterManager` (Python) | Done | 12 pytest cases | Memory-budget enforcement, hot-swap, now backed by real native allocation |
 | `ThermalMonitor` (Python) | Done | 5 pytest cases | Pluggable reader, no real sensor wired in |
 | `EloraAllocator` (C++) | Done | 6 cases via ctest | Portable by default; CUDA path unverified |
+| `msp_native` (pybind11 binding) | Done | 5 pytest cases + ASan smoke test | Wires EloraAllocator into AdapterManager for real |
 | `sandbox_watchdog` (C) | Done | 2 scenarios via ctest | Signal-based fallback; sub-ms measured latency |
-| `integrity_check` (C, SHA-256) | Done | Known-answer + tamper tests | Signature/authenticity half is a stub |
+| `integrity_check` (C, SHA-256 + Ed25519) | Done | Known-answer + tamper + signature round-trip tests | Signing primitive done; trust-root distribution still a deployment decision |
 | CUDA kernel | Written, **not run** | Manual code review only | No GPU in this environment |
-| Python <-> C++/C bindings | **Not started** | — | Three subsystems exist independently, not wired together |
 | ONNX -> TVM/LLVM pipeline | **Not started** | — | Needed for the real cross-platform story (see below) |
-| Adapter signing/authenticity | **Not started** | — | Stub only, by design (needs a trust-root decision) |
+| Adapter persistence (save/load) | **Not started** | — | No serialization format wired up yet |
 | Real hardware telemetry | **Not started** | — | Only pluggable interfaces + scripted test doubles exist |
 | B2B marketplace / SDK / registry | **Not started** | — | This is Phase 3 in the v2 doc; nothing here yet |
 | CI actually running on GitHub | **Unverified** | — | Workflow file is written and passes locally; not yet confirmed green in GitHub Actions |
@@ -43,74 +43,120 @@ flowchart TB
         TM -.->|drives, via gate_gradients| PL
     end
 
+    subgraph Bind["src/cpp/bindings.cpp  (pybind11, WIRED)"]
+        NATIVE["msp_native.EloraAllocator\n(Python-callable)"]
+    end
+
     subgraph CPP["src/cpp/  (fully working, CPU-testable)"]
         EA["EloraAllocator\n(KV-cache, dependency-tree eviction)"]
     end
 
     subgraph C["src/daemon/  (fully working, CPU-testable)"]
         WD["sandbox_watchdog\n(thermal/memory/security watchdog)"]
-        IC["integrity_check\n(SHA-256 hashing)"]
+        IC["integrity_check\n(SHA-256 + Ed25519 signing)"]
     end
 
     subgraph CUDA["src/cuda/  (written, UNVERIFIED)"]
         KERNEL["fused_msp_backward_kernel\n(thermal-gated gradient compute)"]
     end
 
-    AM -.->|"NOT WIRED: no bindings call\nEloraAllocator from Python"| EA
+    AM ==>|"WIRED: real allocate/evict\ncalls on every load/unload"| NATIVE
+    NATIVE ==>|pybind11| EA
     TM -.->|"NOT WIRED: no bindings call\nsandbox_watchdog from Python"| WD
     PL -.->|"NOT WIRED: kernel is not called\nfrom the Python training loop"| KERNEL
     IC -.->|"NOT WIRED: no adapter-loading code\npath calls this yet"| PL
 
     subgraph Missing["Not started at all"]
         TVM["ONNX -> Apache TVM/LLVM\ncross-platform compiler"]
-        SIGN["Signature/authenticity\n(trust root, Ed25519)"]
+        PERSIST["Adapter persistence\n(save/load format)"]
         SDK["B2B marketplace SDK\n+ adapter registry"]
     end
 ```
 
-In words: the Python layer is a complete, self-contained, tested
-reference implementation. The C++ allocator and C daemon are complete,
-tested, *standalone* subsystems with their own test suites. **None of
-these three are called from each other yet.** A real product build needs
-a binding layer (most naturally pybind11, since `EloraAllocator` is C++
-and the daemon is C) so, for example, `AdapterManager.load_adapter()`
-could actually reserve a KV-cache block via `EloraAllocator`, and
-`ThermalMonitor` could actually read from `sandbox_watchdog`'s telemetry
-struct instead of Python-side test doubles. That binding layer does not
-exist yet — see "What's left to do" below.
+In words: `AdapterManager.load_adapter()` / `unload_adapter()` now perform
+**real** allocation and eviction through `EloraAllocator`, via a pybind11
+binding (`src/cpp/bindings.cpp` → `msp_native`), verified end-to-end (byte
+counts match between the Python and native sides, eviction actually frees
+native memory, budget rejection never touches the native allocator). This
+is optional and gracefully degrades: if the extension hasn't been built
+(no C++ toolchain, or simply not built yet), `AdapterManager` falls back
+to its original pure-Python byte-tracking behavior automatically — check
+`AdapterManager.native_backed` to see which mode you're in.
+
+Still not wired: `ThermalMonitor` doesn't yet read from
+`sandbox_watchdog`'s telemetry struct (they remain two independent
+pluggable-reader systems, one Python one C, not sharing a data source),
+and the CUDA kernel is not called from the Python training loop. See
+"What's left to do" below.
 
 ## What's done
 
 - **Python reference implementation** (`src/python/msp/`): the LoRA-style
   adapter with the dynamic gate, the memory-budgeted hot-swap manager, and
-  pluggable thermal-aware gradient gating. 24 passing pytest cases,
+  pluggable thermal-aware gradient gating. 29 passing pytest cases,
   including regression tests for every bug fixed relative to the original
   spec (see `ARCHITECTURE.md` for the list).
 - **C++ KV-cache allocator** (`src/cpp/elora_allocator.*`): adapter-scoped
   dependency-tree eviction, portable by default with an opt-in CUDA build
   path. 6 test cases, clean under AddressSanitizer + UndefinedBehaviorSanitizer.
+- **Python <-> C++ binding** (`src/cpp/bindings.cpp` → `msp_native`):
+  pybind11 extension wiring `EloraAllocator` into `AdapterManager`, so
+  `load_adapter`/`unload_adapter` perform real allocation/eviction, not
+  just Python-side byte counting. Optional and auto-detected — falls back
+  to the original pure-Python behavior if the extension isn't built.
+  5 dedicated pytest cases plus a standalone ASan/UBSan smoke test
+  (isolated from PyTorch's own import-time allocations, which show up as
+  unrelated "leaks" under ASan if you test through the full `msp` package
+  import — see the binding's own verification notes for how to reproduce
+  the isolated check).
 - **C watchdog + integrity daemon** (`src/daemon/`): signal-based
   (not cross-thread-`longjmp`-based) fallback mechanism, measured
   sub-millisecond in this environment; SHA-256 integrity hashing with
-  known-answer tests. Also clean under sanitizers.
-- **Build system**: CMake for the C/C++/daemon layer, `pyproject.toml`
-  for the Python package, a GitHub Actions workflow covering both
-  (CPU-only — the CUDA path is explicitly out of scope for CI, since no
-  GPU runner is configured).
+  known-answer tests, **plus real Ed25519 signing/verification**
+  (`msp_ed25519_sign` / `msp_verify_signature`) with round-trip and
+  tamper-detection tests. Also clean under sanitizers.
+- **Build system**: CMake for the C/C++/daemon/bindings layer (with
+  `-fPIC` enabled globally so the static libs link cleanly into the
+  pybind11 shared module — an actual bug caught and fixed while wiring
+  this up, see "Bugs found while continuing this work" below),
+  `pyproject.toml` for the Python package, a GitHub Actions workflow
+  covering both (CPU-only — the CUDA path is explicitly out of scope for
+  CI, since no GPU runner is configured).
 - **Documentation**: this file, `ARCHITECTURE.md` (what was fixed and
   why), `SECURITY.md` (honest threat-model statement).
+
+## Bugs found while continuing this work
+
+Two more real bugs surfaced while building on top of the initial
+implementation, beyond the ones in `ARCHITECTURE.md`:
+
+- **Missing `-fPIC`**: linking `elora_allocator` (a static lib, compiled
+  without position-independent code by CMake's default) into
+  `msp_native.so` (a shared object) failed at link time with
+  `relocation R_X86_64_PC32 ... can not be used when making a shared
+  object`. Fixed by setting `CMAKE_POSITION_INDEPENDENT_CODE ON` globally
+  in `CMakeLists.txt`.
+- **Wrong import path for the compiled extension**: the pybind11 module
+  is built directly into `src/python/msp/` (correct — that's where a
+  compiled extension belongs inside a proper Python package), but the
+  first version of `adapter_manager.py` used `import msp_native`
+  (absolute/top-level) instead of `from . import msp_native` (relative),
+  so it silently fell back to pure-Python mode with no error, only
+  discovered by explicitly checking `AdapterManager.native_backed` after
+  the "successful" build. Fixed, and now covered by
+  `test_native_backend_availability_is_reported_honestly`.
 
 ## What's left to do
 
 Roughly in the order a next contributor would probably want to tackle
 them:
 
-1. **Wire the subsystems together.** Right now Python, C++, and C are
-   three independent, tested islands. The highest-value next step is
-   likely a pybind11 binding exposing `EloraAllocator` to Python so
-   `AdapterManager` can call real allocation/eviction instead of just
-   tracking byte counts, plus a way for `ThermalMonitor` to consume real
-   telemetry from `sandbox_watchdog` (or share a reader implementation).
+1. **Wire `ThermalMonitor` to `sandbox_watchdog`'s real telemetry.** The
+   Python↔C++ allocator binding (above) is done; the thermal side is
+   still two independent pluggable-reader systems (Python's
+   `ThermalMonitor.reader` and C's `msp_telemetry_reader_fn`) that don't
+   share a data source. A pybind11 binding exposing `msp_telemetry_t`
+   reads would let one Python-side reader drive both.
 2. **Validate the CUDA kernel on real hardware.** It's written and
    reviewed but never compiled or run. See the validation recipe in the
    comment block at the top of `fused_msp_backward_kernel.cu`
@@ -130,10 +176,11 @@ them:
    isolation; there's no example wiring a `StructuralPluginLayer` into an
    actual multi-layer transformer block and running a real training loop
    against it.
-6. **Signature/authenticity.** `msp_verify_signature_STUB()` is
-   deliberately unimplemented. Needs a trust-root decision (embedded
-   public key vs. certificate chain vs. attestation service) before it
-   can be filled in — see `SECURITY.md` for the tradeoffs.
+6. **Trust-root decision for signature verification.** The cryptographic
+   primitive is done (`msp_verify_signature`, Ed25519, tested) — what's
+   left is a deployment decision about where a verifier gets a public key
+   it should trust (embedded key vs. certificate chain vs. attestation
+   service) and how revocation works. See `SECURITY.md`.
 7. **The ONNX -> Apache TVM/LLVM cross-platform pipeline.** This is the
    architecturally-sound way (per the v2 design doc) to actually deploy
    across Apple AMX / Qualcomm Hexagon / etc. Nothing toward this exists
@@ -150,17 +197,20 @@ them:
 ## How to verify this status yourself
 
 ```bash
-# Python (24 tests)
+# Install everything, including pybind11 for the native binding
 pip install -r requirements.txt
-PYTHONPATH=src/python python -m pytest tests/python -v
 
-# C/C++/daemon (3 test binaries via ctest)
+# C/C++/daemon/bindings (builds msp_native.so into src/python/msp/ automatically)
 cmake -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 
-# Same, under AddressSanitizer + UndefinedBehaviorSanitizer
-cmake -B build-asan -DCMAKE_BUILD_TYPE=Debug \
+# Python (29 tests -- 5 of these specifically exercise the native binding
+# built just above; they're skipped, not failed, if you skip that step)
+PYTHONPATH=src/python python -m pytest tests/python -v
+
+# Same C/C++ tests, under AddressSanitizer + UndefinedBehaviorSanitizer
+cmake -B build-asan -DCMAKE_BUILD_TYPE=Debug -DMSP_BUILD_PYTHON_BINDINGS=OFF \
   -DCMAKE_C_FLAGS="-fsanitize=address,undefined -g -fno-omit-frame-pointer" \
   -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -g -fno-omit-frame-pointer" \
   -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
