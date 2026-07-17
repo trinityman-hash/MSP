@@ -12,15 +12,15 @@ model, see [`SECURITY.md`](SECURITY.md).
 |---|---|---|---|
 | `StructuralPluginLayer` (Python) | Done | 12 pytest cases | Core LoRA adapter, gate, device/dtype-aware |
 | `AdapterManager` (Python) | Done | 12 pytest cases | Memory-budget enforcement, hot-swap, now backed by real native allocation |
-| `ThermalMonitor` (Python) | Done | 5 pytest cases | Pluggable reader, no real sensor wired in |
+| `ThermalMonitor` (Python) | Done | 5 pytest cases | Pluggable reader interface |
+| `LinuxThermalZoneReader` (Python) | Done | 12 pytest cases | Real `/sys/class/thermal` reader; tested against a simulated sysfs tree (no real thermal zones in this dev container) |
+| Adapter persistence (`msp.persistence`) | Done | 8 pytest cases | safetensors save/load, round-trip and multi-layer tested |
 | `EloraAllocator` (C++) | Done | 6 cases via ctest | Portable by default; CUDA path unverified |
 | `msp_native` (pybind11 binding) | Done | 5 pytest cases + ASan smoke test | Wires EloraAllocator into AdapterManager for real |
-| `sandbox_watchdog` (C) | Done | 2 scenarios via ctest | Signal-based fallback; sub-ms measured latency |
+| `sandbox_watchdog` (C) | Done | 2 scenarios via ctest | Signal-based fallback; sub-ms measured latency; telemetry reader still test-double only on the C side |
 | `integrity_check` (C, SHA-256 + Ed25519) | Done | Known-answer + tamper + signature round-trip tests | Signing primitive done; trust-root distribution still a deployment decision |
-| CUDA kernel | Written, **not run** | Manual code review only | No GPU in this environment |
+| CUDA kernel | Written, **not run** | Manual code review only | No GPU in this environment — see "CUDA validation on Google Colab" below |
 | ONNX -> TVM/LLVM pipeline | **Not started** | — | Needed for the real cross-platform story (see below) |
-| Adapter persistence (save/load) | **Not started** | — | No serialization format wired up yet |
-| Real hardware telemetry | **Not started** | — | Only pluggable interfaces + scripted test doubles exist |
 | B2B marketplace / SDK / registry | **Not started** | — | This is Phase 3 in the v2 doc; nothing here yet |
 | CI actually running on GitHub | **Unverified** | — | Workflow file is written and passes locally; not yet confirmed green in GitHub Actions |
 | License | **Not chosen** | — | No `LICENSE` file yet |
@@ -39,8 +39,12 @@ flowchart TB
         PL["StructuralPluginLayer\n(LoRA adapter + gate)"]
         AM["AdapterManager\n(memory budget + hot-swap)"]
         TM["ThermalMonitor\n(pluggable telemetry)"]
+        LTZ["LinuxThermalZoneReader\n(real sysfs telemetry)"]
+        PERSIST["persistence.py\n(safetensors save/load)"]
         AM -->|owns 1..N| PL
         TM -.->|drives, via gate_gradients| PL
+        LTZ -.->|"can be passed as\nThermalMonitor(reader=...)"| TM
+        PERSIST -.->|reconstructs| PL
     end
 
     subgraph Bind["src/cpp/bindings.cpp  (pybind11, WIRED)"]
@@ -68,7 +72,6 @@ flowchart TB
 
     subgraph Missing["Not started at all"]
         TVM["ONNX -> Apache TVM/LLVM\ncross-platform compiler"]
-        PERSIST["Adapter persistence\n(save/load format)"]
         SDK["B2B marketplace SDK\n+ adapter registry"]
     end
 ```
@@ -115,6 +118,28 @@ and the CUDA kernel is not called from the Python training loop. See
   known-answer tests, **plus real Ed25519 signing/verification**
   (`msp_ed25519_sign` / `msp_verify_signature`) with round-trip and
   tamper-detection tests. Also clean under sanitizers.
+- **Adapter persistence** (`src/python/msp/persistence.py`): save/load a
+  set of `StructuralPluginLayer` weights to a single `.safetensors` file
+  (rank, alpha, and the routing gate state are preserved as metadata
+  alongside the tensors). Chosen over pickle-based `torch.save` because
+  safetensors can't execute code on load -- relevant since this format is
+  meant to eventually carry adapters from third-party publishers (the B2B
+  marketplace use case). 8 pytest cases, including a check that a loaded
+  layer produces bit-for-bit identical output to the original. Does not
+  itself verify integrity/authenticity of a loaded file -- pair with
+  `integrity_check.c`'s functions (via a future Python binding) for
+  untrusted sources.
+- **Real Linux thermal telemetry reader** (`LinuxThermalZoneReader` in
+  `thermal.py`): reads real `/sys/class/thermal/thermal_zone*/temp`
+  values (converting the kernel's millidegree-Celsius units), with
+  zone-type filtering (e.g. only "cpu" zones) and a choice of max/mean
+  aggregation across zones. This container has no real thermal zones to
+  read, so it's tested against a simulated sysfs directory tree built in
+  the test itself (12 pytest cases) -- the parsing/aggregation/error-path
+  logic is fully exercised; what's NOT exercised is reading actual
+  hardware, which needs to happen on a real Linux machine. The C side
+  (`msp_telemetry_reader_fn` in `sandbox_watchdog.h`) still only has a
+  scripted test double, not a real reader -- see "What's left to do".
 - **Build system**: CMake for the C/C++/daemon/bindings layer (with
   `-fPIC` enabled globally so the static libs link cleanly into the
   pybind11 shared module — an actual bug caught and fixed while wiring
@@ -151,48 +176,85 @@ implementation, beyond the ones in `ARCHITECTURE.md`:
 Roughly in the order a next contributor would probably want to tackle
 them:
 
-1. **Wire `ThermalMonitor` to `sandbox_watchdog`'s real telemetry.** The
-   Python↔C++ allocator binding (above) is done; the thermal side is
-   still two independent pluggable-reader systems (Python's
-   `ThermalMonitor.reader` and C's `msp_telemetry_reader_fn`) that don't
-   share a data source. A pybind11 binding exposing `msp_telemetry_t`
-   reads would let one Python-side reader drive both.
-2. **Validate the CUDA kernel on real hardware.** It's written and
-   reviewed but never compiled or run. See the validation recipe in the
-   comment block at the top of `fused_msp_backward_kernel.cu`
-   (cross-check against `StructuralPluginLayer`'s PyTorch autograd
-   gradient on a small fixed input) before trusting it.
-3. **Real telemetry readers.** `ThermalMonitor` and
-   `msp_telemetry_reader_fn` are interfaces with only test doubles behind
-   them right now. Someone needs to write an actual reader for a target
-   platform (e.g. Linux `/sys/class/thermal/thermal_zone*/temp` as a
-   starting point for a dev-machine reader; real mobile targets will need
-   platform-specific APIs).
-4. **Adapter persistence.** There's no save/load format for adapter
-   weights yet. `safetensors` is the natural choice (used by the
-   HF/PEFT ecosystem this project is otherwise aligned with) but nothing
-   here reads or writes it.
-5. **End-to-end training example.** Everything here is unit-tested in
+1. **Validate the CUDA kernel on real hardware.** It's written and
+   reviewed but never compiled or run in this environment (no GPU). See
+   "CUDA validation on Google Colab" below for the exact process to do
+   this on Colab's free-tier T4 GPU.
+2. **Real C-side telemetry reader.** The Python side now has
+   `LinuxThermalZoneReader` (real sysfs reads); the C side
+   (`msp_telemetry_reader_fn` in `sandbox_watchdog.h`) still only has the
+   scripted test double from `tests/daemon/test_watchdog.c`. Either port
+   the same sysfs-reading logic to C, or (probably better) bind
+   `LinuxThermalZoneReader` through pybind11 so both languages share one
+   implementation instead of maintaining two.
+3. **Wire `ThermalMonitor` to `sandbox_watchdog`'s real telemetry.** The
+   Python↔C++ allocator binding is done; the thermal side is still two
+   independent pluggable-reader systems (Python's `ThermalMonitor.reader`
+   and C's `msp_telemetry_reader_fn`) that don't share a data source.
+4. **End-to-end training example.** Everything here is unit-tested in
    isolation; there's no example wiring a `StructuralPluginLayer` into an
    actual multi-layer transformer block and running a real training loop
    against it.
-6. **Trust-root decision for signature verification.** The cryptographic
+5. **Trust-root decision for signature verification.** The cryptographic
    primitive is done (`msp_verify_signature`, Ed25519, tested) — what's
    left is a deployment decision about where a verifier gets a public key
    it should trust (embedded key vs. certificate chain vs. attestation
    service) and how revocation works. See `SECURITY.md`.
-7. **The ONNX -> Apache TVM/LLVM cross-platform pipeline.** This is the
+6. **The ONNX -> Apache TVM/LLVM cross-platform pipeline.** This is the
    architecturally-sound way (per the v2 design doc) to actually deploy
    across Apple AMX / Qualcomm Hexagon / etc. Nothing toward this exists
    yet; it needs the TVM toolchain and vendor SDKs.
-8. **B2B marketplace SDK / adapter registry.** Phase 3 in the v2 doc's
+7. **B2B marketplace SDK / adapter registry.** Phase 3 in the v2 doc's
    roadmap. Not started — arguably shouldn't be, until steps 1-4 above
    give you something worth registering.
-9. **Housekeeping:** pick a `LICENSE`, confirm the GitHub Actions workflow
+8. **Housekeeping:** pick a `LICENSE`, confirm the GitHub Actions workflow
    is actually green on real GitHub infrastructure (it's only been
    validated by running the equivalent commands locally), and decide on a
    versioning/release process once there's a first real consumer of this
    package.
+
+## CUDA validation on Google Colab
+
+`src/cuda/fused_msp_backward_kernel.cu` has never been compiled or
+executed — this development environment has no NVIDIA GPU. Colab's free
+tier provides one (a T4), which is enough to validate it. Exact process:
+
+1. Go to **colab.research.google.com** → **New notebook**.
+2. **Runtime → Change runtime type → T4 GPU → Save.**
+3. In the first cell, clone the repo and confirm the GPU is visible:
+   ```python
+   !git clone https://github.com/trinityman-hash/MSP.git
+   %cd MSP
+   !nvidia-smi
+   ```
+   `nvidia-smi` should print a T4 in its table. If it doesn't, the
+   runtime type didn't actually switch to GPU — repeat step 2.
+4. Compile the kernel (Colab images ship `nvcc` preinstalled):
+   ```python
+   !nvcc -O3 -arch=sm_75 --compiler-options -Wall \
+       -c src/cuda/fused_msp_backward_kernel.cu \
+       -o fused_msp_backward_kernel.o
+   !echo "compiled: $?"
+   ```
+   (T4's compute capability is 7.5, hence `sm_75` — different from the
+   `sm_80` example in the file's own header comment, which assumed an
+   A100-class card.)
+5. **This only proves it compiles, not that it's correct.** The real
+   check is cross-validating the kernel's output against
+   `StructuralPluginLayer`'s own PyTorch autograd gradient, per the
+   validation recipe already written into the top of
+   `fused_msp_backward_kernel.cu`. That requires a small host (Python)
+   wrapper that loads the compiled kernel via `ctypes`/`cupy`/a tiny
+   pybind11 module, feeds it the same fixed input PyTorch computed a
+   gradient for, and diffs the two results numerically (`torch.allclose`,
+   not exact equality — floating point). That wrapper does not exist yet;
+   writing it is the concrete next step, and worth doing on Colab
+   directly since it needs the GPU to run either way.
+
+Since this needs to happen from a phone: Colab's notebook UI works in a
+mobile browser exactly as the steps above describe — each `!command` goes
+in its own cell, run with the ▶ button, and output/errors print directly
+below the cell.
 
 ## How to verify this status yourself
 
@@ -205,7 +267,7 @@ cmake -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 
-# Python (29 tests -- 5 of these specifically exercise the native binding
+# Python (49 tests -- 5 of these specifically exercise the native binding
 # built just above; they're skipped, not failed, if you skip that step)
 PYTHONPATH=src/python python -m pytest tests/python -v
 
