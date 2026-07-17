@@ -21,6 +21,22 @@ from .plugin_layer import StructuralPluginLayer
 
 DEFAULT_MEMORY_BUDGET_BYTES = 512 * 1024 * 1024  # 512MB, per spec Sec. 1
 
+# Optional native binding (src/cpp/bindings.cpp -> msp_native), built via
+# `cmake -B build && cmake --build build` with pybind11 available. This is
+# the fix for STATUS.md item #1 ("wire the subsystems together"):
+# previously AdapterManager only tracked byte counts in pure Python and
+# never actually touched EloraAllocator. When the extension is present,
+# every load/unload now performs a real allocation/eviction through it;
+# when it isn't (no C++ toolchain, or simply not built yet), everything
+# falls back to the pure-Python byte-tracking behavior this class always
+# had, so nothing that worked before is broken by this becoming optional.
+try:
+    from . import msp_native  # type: ignore
+    _NATIVE_AVAILABLE = True
+except ImportError:
+    msp_native = None  # type: ignore
+    _NATIVE_AVAILABLE = False
+
 
 class AdapterBudgetError(RuntimeError):
     """Raised when loading an adapter would exceed the memory budget."""
@@ -50,6 +66,21 @@ class AdapterManager:
         self.memory_budget_bytes = memory_budget_bytes
         self._adapters: Dict[str, _AdapterRecord] = {}
         self._active_adapter_id: Optional[str] = None
+
+        # Native backing allocator (see module-level _NATIVE_AVAILABLE).
+        # EloraAllocator's C++ interface is keyed by int, but adapter_id is
+        # a string here (matching the spec's usage), so we maintain a
+        # stable string->int mapping alongside it.
+        self._native = msp_native.EloraAllocator() if _NATIVE_AVAILABLE else None
+        self._native_ids: Dict[str, int] = {}
+        self._next_native_id = 1
+
+    @property
+    def native_backed(self) -> bool:
+        """True if this instance is actually allocating real memory
+        through EloraAllocator (msp_native extension built and importable),
+        rather than only tracking byte counts in Python."""
+        return self._native is not None
 
     # ------------------------------------------------------------------
 
@@ -86,6 +117,30 @@ class AdapterManager:
 
         self._adapters[adapter_id] = _AdapterRecord(adapter_id=adapter_id, layers=dict(layers))
 
+        if self._native is not None:
+            native_id = self._next_native_id
+            self._next_native_id += 1
+            self._native_ids[adapter_id] = native_id
+            for layer in layers.values():
+                nbytes = layer.parameter_bytes()
+                if nbytes == 0:
+                    continue
+                handle = self._native.allocate_kv_context(native_id, nbytes)
+                if handle is None:
+                    # Real allocation failed (e.g. host out of memory) even
+                    # though our own budget accounting said this should
+                    # fit. Roll back everything for this adapter -- both
+                    # the Python-side record and any native blocks already
+                    # reserved for it -- so we don't leave partial state.
+                    self._native.execute_dependency_eviction(native_id)
+                    del self._native_ids[adapter_id]
+                    del self._adapters[adapter_id]
+                    raise AdapterBudgetError(
+                        f"adapter '{adapter_id}' passed the {self.memory_budget_bytes}-byte "
+                        f"budget check but the underlying host allocation for a "
+                        f"{nbytes}-byte block failed (out of memory?)"
+                    )
+
     def unload_adapter(self, adapter_id: str) -> None:
         """
         Evict an adapter and everything it owns -- the Python-level
@@ -99,6 +154,11 @@ class AdapterManager:
             layer.clear_gradient_gate()
         if self._active_adapter_id == adapter_id:
             self._active_adapter_id = None
+
+        if self._native is not None:
+            native_id = self._native_ids.pop(adapter_id, None)
+            if native_id is not None:
+                self._native.execute_dependency_eviction(native_id)
 
     def activate(self, adapter_id: str) -> None:
         if adapter_id not in self._adapters:
