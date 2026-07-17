@@ -1,3 +1,4 @@
 torch>=2.0
 pytest>=7.0
 pybind11>=2.11
+safetensors>=0.4
