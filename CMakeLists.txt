@@ -64,11 +64,12 @@ if(MSP_BUILD_PYTHON_BINDINGS)
 endif()
 
 # ---------------------------------------------------------------------------
-# sandbox_watchdog + integrity_check (C)
+# sandbox_watchdog + integrity_check + thermal_reader (C)
 # ---------------------------------------------------------------------------
 add_library(msp_daemon STATIC
     src/daemon/sandbox_watchdog.c
     src/daemon/integrity_check.c
+    src/daemon/thermal_reader.c
 )
 target_include_directories(msp_daemon PUBLIC src/daemon)
 target_link_libraries(msp_daemon PUBLIC OpenSSL::Crypto Threads::Threads)
@@ -90,4 +91,8 @@ if(MSP_BUILD_TESTS)
     add_executable(test_watchdog tests/daemon/test_watchdog.c)
     target_link_libraries(test_watchdog PRIVATE msp_daemon)
     add_test(NAME test_watchdog COMMAND test_watchdog)
+
+    add_executable(test_thermal_reader tests/daemon/test_thermal_reader.c)
+    target_link_libraries(test_thermal_reader PRIVATE msp_daemon)
+    add_test(NAME test_thermal_reader COMMAND test_thermal_reader)
 endif()
