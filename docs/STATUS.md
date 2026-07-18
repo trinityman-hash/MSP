@@ -1,4 +1,4 @@
-# MSP Project Status &amp; Architecture Map
+# MSP Project Status & Architecture Map
 
 Read this first if you're new to the repo. It answers two questions:
 "what actually works right now" and "how do the pieces fit together."
