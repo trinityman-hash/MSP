@@ -7,7 +7,7 @@ memory budget, with thermal-aware training and a watchdog-driven fallback
 path.
 
 This repo implements the core mechanics described in the `Project
-Apex-Edge` design docs, with the real bugs and category errors those docs
+Apex-Edge` , with the real bugs and category errors those docs
 contained fixed and documented.
 
 **New here? Start with [`docs/STATUS.md`](docs/STATUS.md)** — it has a
