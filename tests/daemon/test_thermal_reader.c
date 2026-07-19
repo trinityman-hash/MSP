@@ -3,6 +3,14 @@
 // zones to read). Deliberately mirrors tests/python/test_thermal.py's
 // LinuxThermalZoneReader cases so the two implementations are checked
 // against the same behavior, not just each compiling cleanly.
+//
+// _XOPEN_SOURCE 700 (POSIX.1-2008) must be defined before any system
+// header is included: nftw()/FTW_DEPTH/FTW_PHYS from <ftw.h> are NOT
+// visible under glibc's default feature-test macros (unlike most POSIX
+// functions, which glibc exposes by default) -- they specifically need
+// _XOPEN_SOURCE >= 500. This must be a #define here, not a compiler
+// flag, since CMakeLists.txt builds this file with no extra -D flags.
+#define _XOPEN_SOURCE 700
 
 #include "thermal_reader.h"
 
