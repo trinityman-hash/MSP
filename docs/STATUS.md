@@ -17,12 +17,13 @@ model, see [`SECURITY.md`](SECURITY.md).
 | Adapter persistence (`msp.persistence`) | Done | 8 pytest cases | safetensors save/load, round-trip and multi-layer tested |
 | `EloraAllocator` (C++) | Done | 6 cases via ctest | Portable by default; CUDA path unverified |
 | `msp_native` (pybind11 binding) | Done | 5 pytest cases + ASan smoke test | Wires EloraAllocator into AdapterManager for real |
-| `sandbox_watchdog` (C) | Done | 2 scenarios via ctest | Signal-based fallback; sub-ms measured latency; telemetry reader still test-double only on the C side |
+| `sandbox_watchdog` (C) | Done | 2 scenarios via ctest | Signal-based fallback; sub-ms measured latency |
+| `thermal_reader` (C, real sysfs reader) | Done | 12 cases via ctest | Mirrors Python's `LinuxThermalZoneReader`; type-compatible with `msp_telemetry_reader_fn` but not yet wired as any daemon's default reader (see "What's left to do") |
 | `integrity_check` (C, SHA-256 + Ed25519) | Done | Known-answer + tamper + signature round-trip tests | Signing primitive done; trust-root distribution still a deployment decision |
 | CUDA kernel | Compiles clean on real GPU; **numerically unvalidated** | `nvcc` build on a Colab T4 (exit 0, 2026-07-17) + manual code review | Builds, but its output has not yet been diffed against the PyTorch reference — the wrapper to do that now exists (`tests/cuda/validate_gradient_kernel.py`) but hasn't been run on a GPU yet. See "CUDA validation on Google Colab" below |
 | ONNX -> TVM/LLVM pipeline | **Not started** | — | Needed for the real cross-platform story (see below) |
 | B2B marketplace / SDK / registry | **Not started** | — | This is Phase 3 in the v2 doc; nothing here yet |
-| CI actually running on GitHub | **Unverified** | — | Workflow file is written and passes locally; not yet confirmed green in GitHub Actions |
+| CI running on GitHub | **Verified against a faithful local reproduction** | Full `cmake`+`ctest`+`pytest` run, matching each of the 3 workflow jobs' exact commands/flags, 2026-07-18 | A real compile bug was caught and fixed this way before it could land as a broken build (see "Bugs found while continuing this work"). Not the same as watching a green checkmark on the Actions tab itself — see note below |
 | License | **Not chosen** | — | No `LICENSE` file yet |
 
 ## Full architecture map
@@ -58,6 +59,8 @@ flowchart TB
     subgraph C["src/daemon/  (fully working, CPU-testable)"]
         WD["sandbox_watchdog\n(thermal/memory/security watchdog)"]
         IC["integrity_check\n(SHA-256 + Ed25519 signing)"]
+        CTZ["thermal_reader\n(real sysfs telemetry)"]
+        CTZ -.->|"type-compatible via\nmsp_thermal_reader_telemetry_fn,\nbut no daemon entry point\nplugs it in by default yet"| WD
     end
 
     subgraph CUDA["src/cuda/  (compiles on real GPU, numerically UNVALIDATED)"]
@@ -86,11 +89,13 @@ is optional and gracefully degrades: if the extension hasn't been built
 to its original pure-Python byte-tracking behavior automatically — check
 `AdapterManager.native_backed` to see which mode you're in.
 
-Still not wired: `ThermalMonitor` doesn't yet read from
-`sandbox_watchdog`'s telemetry struct (they remain two independent
-pluggable-reader systems, one Python one C, not sharing a data source),
-and the CUDA kernel is not called from the Python training loop. See
-"What's left to do" below.
+Still not wired: `ThermalMonitor` (Python) and `sandbox_watchdog` (C)
+remain two independent pluggable-reader systems that don't share a data
+source, even though the C side now has a real reader
+(`thermal_reader.c`) that's a drop-in fit for `msp_watchdog_config_t`'s
+`read_telemetry` field — no daemon entry point actually constructs one
+with it by default yet. The CUDA kernel is also not called from the
+Python training loop. See "What's left to do" below.
 
 ## What's done
 
@@ -129,17 +134,25 @@ and the CUDA kernel is not called from the Python training loop. See
   itself verify integrity/authenticity of a loaded file -- pair with
   `integrity_check.c`'s functions (via a future Python binding) for
   untrusted sources.
-- **Real Linux thermal telemetry reader** (`LinuxThermalZoneReader` in
-  `thermal.py`): reads real `/sys/class/thermal/thermal_zone*/temp`
-  values (converting the kernel's millidegree-Celsius units), with
-  zone-type filtering (e.g. only "cpu" zones) and a choice of max/mean
-  aggregation across zones. This container has no real thermal zones to
-  read, so it's tested against a simulated sysfs directory tree built in
-  the test itself (12 pytest cases) -- the parsing/aggregation/error-path
-  logic is fully exercised; what's NOT exercised is reading actual
-  hardware, which needs to happen on a real Linux machine. The C side
-  (`msp_telemetry_reader_fn` in `sandbox_watchdog.h`) still only has a
-  scripted test double, not a real reader -- see "What's left to do".
+- **Real Linux thermal telemetry reader, both languages now**:
+  `LinuxThermalZoneReader` (`src/python/msp/thermal.py`) and
+  `thermal_reader.c`/`.h` (`src/daemon/`) both read real
+  `/sys/class/thermal/thermal_zone*/temp` values (converting the kernel's
+  millidegree-Celsius units), with zone-type filtering (e.g. only "cpu"
+  zones) and a choice of max/mean aggregation across zones. This
+  container has no real thermal zones to read, so both are tested against
+  a simulated sysfs directory tree built in the test itself (12 pytest
+  cases for the Python side, 12 ctest cases for the C side, deliberately
+  mirroring the same scenarios) -- the parsing/aggregation/error-path
+  logic is fully exercised on both; what's NOT exercised by either is
+  reading actual hardware, which needs to happen on a real Linux machine.
+  The C implementation is a second, independent implementation rather
+  than a shared binding -- see `thermal_reader.h`'s header comment for
+  why embedding a Python interpreter into the watchdog daemon was
+  considered and rejected. It also documents a specific safety choice:
+  a failed read reports `+INFINITY`, not `0`, so a broken sensor path can
+  only ever cause the watchdog to over-trigger, never silently mask a
+  real violation by looking like a cold, safe reading.
 - **Build system**: CMake for the C/C++/daemon/bindings layer (with
   `-fPIC` enabled globally so the static libs link cleanly into the
   pybind11 shared module — an actual bug caught and fixed while wiring
@@ -156,12 +169,26 @@ and the CUDA kernel is not called from the Python training loop. See
   thermal-gating logic are correct — see "CUDA validation on Google
   Colab" below for what's still missing and `tests/cuda/validate_gradient_kernel.py`
   for the wrapper that closes that gap once it's actually run.
+- **CI verified against a faithful local reproduction**: rather than
+  trusting the workflow file's own internal consistency, every one of
+  `ci.yml`'s 3 jobs was reproduced locally with the exact same
+  commands/flags (installing the same dependencies, running the same
+  `cmake`/`ctest`/`pytest` invocations) and all pass: 4/4 ctest cases in
+  the plain build, 4/4 again under ASan+UBSan, and 45 passed + 4 correctly
+  skipped (native-binding tests, which need the C++ extension the
+  `python-tests` job doesn't build) out of 49 pytest cases. This caught
+  and fixed a real compile bug (see "Bugs found while continuing this
+  work") before it could land as a broken build. It is still not the same
+  guarantee as watching an actual green checkmark on GitHub's Actions
+  tab -- the runner image, available system packages, or network access
+  could still differ in some way this reproduction didn't -- but it's a
+  much stronger signal than "the YAML looks right."
 - **Documentation**: this file, `ARCHITECTURE.md` (what was fixed and
   why), `SECURITY.md` (honest threat-model statement).
 
 ## Bugs found while continuing this work
 
-Two more real bugs surfaced while building on top of the initial
+Three more real bugs surfaced while building on top of the initial
 implementation, beyond the ones in `ARCHITECTURE.md`:
 
 - **Missing `-fPIC`**: linking `elora_allocator` (a static lib, compiled
@@ -179,6 +206,19 @@ implementation, beyond the ones in `ARCHITECTURE.md`:
   discovered by explicitly checking `AdapterManager.native_backed` after
   the "successful" build. Fixed, and now covered by
   `test_native_backend_availability_is_reported_honestly`.
+- **Missing `_XOPEN_SOURCE` before `<ftw.h>`**: `test_thermal_reader.c`
+  uses `nftw()`/`FTW_DEPTH`/`FTW_PHYS` to clean up its simulated sysfs
+  trees, which — unlike most POSIX functions glibc exposes by default —
+  specifically need `_XOPEN_SOURCE >= 500` defined before any system
+  header is included. Ad-hoc local testing while writing the file had
+  been passing `-D_GNU_SOURCE` on the compiler command line, which masked
+  the gap; the real `CMakeLists.txt` build (and therefore CI) compiles
+  with no extra `-D` flags at all, so this would have been a real,
+  reproducible compile failure (`error: 'FTW_DEPTH' undeclared`, etc.) on
+  every actual build. Caught by rebuilding with CMake's exact default
+  flags (`-std=gnu11`, no extra defines) rather than trusting the earlier
+  ad-hoc testing, and fixed with `#define _XOPEN_SOURCE 700` at the top
+  of the file, before its first `#include`.
 
 ## What's left to do
 
@@ -196,38 +236,40 @@ them:
    thermal-gated code paths. It has not been run against a GPU yet — that
    run is the actual remaining step. See "CUDA validation on Google
    Colab" below for exact commands.
-2. **Real C-side telemetry reader.** The Python side now has
-   `LinuxThermalZoneReader` (real sysfs reads); the C side
-   (`msp_telemetry_reader_fn` in `sandbox_watchdog.h`) still only has the
-   scripted test double from `tests/daemon/test_watchdog.c`. Either port
-   the same sysfs-reading logic to C, or (probably better) bind
-   `LinuxThermalZoneReader` through pybind11 so both languages share one
-   implementation instead of maintaining two.
-3. **Wire `ThermalMonitor` to `sandbox_watchdog`'s real telemetry.** The
-   Python↔C++ allocator binding is done; the thermal side is still two
-   independent pluggable-reader systems (Python's `ThermalMonitor.reader`
-   and C's `msp_telemetry_reader_fn`) that don't share a data source.
-4. **End-to-end training example.** Everything here is unit-tested in
+2. **Wire `thermal_reader.c` into an actual watchdog entry point, and
+   `ThermalMonitor` to it in turn.** The C-side reader now exists and is
+   proven type-compatible with `msp_watchdog_config_t.read_telemetry`
+   (see the architecture diagram), but nothing actually constructs a
+   `msp_watchdog_config_t` with it outside of tests -- there's no
+   standalone daemon `main()` yet. Once there is, the remaining gap is
+   Python's `ThermalMonitor` and the C daemon still being two independent
+   pluggable-reader systems that don't share a data source; closing that
+   likely means exposing the daemon's telemetry (e.g. via a small
+   pybind11 binding or a shared-memory/socket handoff) back to Python,
+   not just having both languages read `/sys/class/thermal` independently
+   and hope they agree.
+3. **End-to-end training example.** Everything here is unit-tested in
    isolation; there's no example wiring a `StructuralPluginLayer` into an
    actual multi-layer transformer block and running a real training loop
    against it.
-5. **Trust-root decision for signature verification.** The cryptographic
+4. **Trust-root decision for signature verification.** The cryptographic
    primitive is done (`msp_verify_signature`, Ed25519, tested) — what's
    left is a deployment decision about where a verifier gets a public key
    it should trust (embedded key vs. certificate chain vs. attestation
    service) and how revocation works. See `SECURITY.md`.
-6. **The ONNX -> Apache TVM/LLVM cross-platform pipeline.** This is the
+5. **The ONNX -> Apache TVM/LLVM cross-platform pipeline.** This is the
    architecturally-sound way (per the v2 design doc) to actually deploy
    across Apple AMX / Qualcomm Hexagon / etc. Nothing toward this exists
    yet; it needs the TVM toolchain and vendor SDKs.
-7. **B2B marketplace SDK / adapter registry.** Phase 3 in the v2 doc's
-   roadmap. Not started — arguably shouldn't be, until steps 1-4 above
+6. **B2B marketplace SDK / adapter registry.** Phase 3 in the v2 doc's
+   roadmap. Not started — arguably shouldn't be, until the steps above
    give you something worth registering.
-8. **Housekeeping:** pick a `LICENSE`, confirm the GitHub Actions workflow
-   is actually green on real GitHub infrastructure (it's only been
-   validated by running the equivalent commands locally), and decide on a
-   versioning/release process once there's a first real consumer of this
-   package.
+7. **Housekeeping:** pick a `LICENSE`, watch an actual GitHub Actions run
+   go green on GitHub's own infrastructure (everything so far has been
+   verified via a faithful *local* reproduction of the same commands --
+   see the CI row in the table above for what that does and doesn't
+   guarantee), and decide on a versioning/release process once there's a
+   first real consumer of this package.
 
 ## CUDA validation on Google Colab
 
