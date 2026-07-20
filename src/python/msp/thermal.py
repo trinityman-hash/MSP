@@ -218,3 +218,74 @@ class LinuxThermalZoneReader:
         if self._aggregate == "max":
             return max(readings)
         return sum(readings) / len(readings)
+
+
+class WatchdogTelemetryReader:
+    """
+    Client for the C watchdog daemon's telemetry socket
+    (src/daemon/telemetry_server.c, served by the `watchdogd` binary --
+    see src/daemon/watchdogd_main.c).
+
+    LinuxThermalZoneReader above and the C daemon's own thermal_reader.c
+    each independently read /sys/class/thermal and, in principle, could
+    disagree (different aggregation, a filter typo, a race between the
+    two reads). Pointing ThermalMonitor at an instance of THIS reader
+    instead makes Python read the exact same number the watchdog daemon
+    is using to decide whether to trigger a fallback, from one real
+    shared data source -- this is what closes the gap docs/STATUS.md
+    flagged: "Python's ThermalMonitor and the C daemon still being two
+    independent pluggable-reader systems that don't share a data source."
+
+    Each call is a fresh, blocking round trip over a Unix domain socket
+    (connect, read one line, disconnect) -- not a persistent stream, and
+    not free; this is a query ("what's the reading right now"), matching
+    ThermalMonitor's own reader contract. Don't put it in a per-microbatch
+    hot loop without accounting for that cost.
+    """
+
+    def __init__(self, socket_path: str = "/tmp/msp_watchdogd.sock", timeout_s: float = 2.0) -> None:
+        self._socket_path = socket_path
+        self._timeout_s = timeout_s
+
+    def __call__(self) -> float:
+        temperature_c, _sram_bytes, _security_violation = self.read_full()
+        return temperature_c
+
+    def read_full(self) -> tuple[float, int, bool]:
+        """
+        Returns (temperature_c, sram_usage_bytes, security_violation) --
+        the full telemetry tuple, for callers that want more than just
+        ThermalMonitor's temperature-only contract (e.g. observability).
+        """
+        import socket as _socket
+
+        sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        sock.settimeout(self._timeout_s)
+        try:
+            sock.connect(self._socket_path)
+            chunks = []
+            while True:
+                chunk = sock.recv(256)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        except OSError as exc:
+            raise RuntimeError(
+                f"failed to read telemetry from watchdog daemon at "
+                f"'{self._socket_path}': {exc}. Is watchdogd running? "
+                f"(see src/daemon/watchdogd_main.c)"
+            ) from exc
+        finally:
+            sock.close()
+
+        line = b"".join(chunks).decode("ascii", errors="strict").strip()
+        parts = line.split()
+        if len(parts) != 3:
+            raise RuntimeError(f"malformed telemetry line from watchdog daemon: {line!r}")
+        try:
+            temperature_c = float(parts[0])
+            sram_usage_bytes = int(parts[1])
+            security_violation = parts[2] != "0"
+        except ValueError as exc:
+            raise RuntimeError(f"malformed telemetry line from watchdog daemon: {line!r}") from exc
+        return temperature_c, sram_usage_bytes, security_violation

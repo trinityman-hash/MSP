@@ -18,7 +18,9 @@ model, see [`SECURITY.md`](SECURITY.md).
 | `EloraAllocator` (C++) | Done | 6 cases via ctest | Portable by default; CUDA path unverified |
 | `msp_native` (pybind11 binding) | Done | 5 pytest cases + ASan smoke test | Wires EloraAllocator into AdapterManager for real |
 | `sandbox_watchdog` (C) | Done | 2 scenarios via ctest | Signal-based fallback; sub-ms measured latency |
-| `thermal_reader` (C, real sysfs reader) | Done | 12 cases via ctest | Mirrors Python's `LinuxThermalZoneReader`; type-compatible with `msp_telemetry_reader_fn` but not yet wired as any daemon's default reader (see "What's left to do") |
+| `thermal_reader` (C, real sysfs reader) | Done | 12 cases via ctest | Mirrors Python's `LinuxThermalZoneReader`; now wired as `watchdogd`'s default reader (see `watchdogd` row below) |
+| `telemetry_server` (C, Unix-socket telemetry bridge) | Done | 3 cases via ctest | Serves one fresh reading per connection over a Unix domain socket, via the same reader `watchdogd`'s watchdog thread uses -- the shared data source closing the Python/C reader-agreement gap |
+| `watchdogd` (C, standalone daemon `main()`) | Done | 2 pytest cases (`test_watchdogd_integration_*`) spawning the real compiled binary against a simulated sysfs tree; skipped, not failed, if the binary isn't built (same convention as the native-binding tests) | Wires `thermal_reader.c` into `sandbox_watchdog.c` and `telemetry_server.c`; re-arms and resumes after a fallback per `MSP_ARM_FALLBACK_POINT()`'s documented contract |
 | `integrity_check` (C, SHA-256 + Ed25519) | Done | Known-answer + tamper + signature round-trip tests | Signing primitive done; trust-root distribution still a deployment decision |
 | CUDA kernel | Compiles clean on real GPU; **numerically unvalidated** | `nvcc` build on a Colab T4 (exit 0, 2026-07-17) + manual code review | Builds, but its output has not yet been diffed against the PyTorch reference — the wrapper to do that now exists (`tests/cuda/validate_gradient_kernel.py`) but hasn't been run on a GPU yet. See "CUDA validation on Google Colab" below |
 | ONNX -> TVM/LLVM pipeline | **Not started** | — | Needed for the real cross-platform story (see below) |
@@ -41,10 +43,12 @@ flowchart TB
         AM["AdapterManager\n(memory budget + hot-swap)"]
         TM["ThermalMonitor\n(pluggable telemetry)"]
         LTZ["LinuxThermalZoneReader\n(real sysfs telemetry)"]
+        WTR["WatchdogTelemetryReader\n(queries watchdogd's socket)"]
         PERSIST["persistence.py\n(safetensors save/load)"]
         AM -->|owns 1..N| PL
         TM -.->|drives, via gate_gradients| PL
         LTZ -.->|"can be passed as\nThermalMonitor(reader=...)"| TM
+        WTR -.->|"can ALSO be passed as\nThermalMonitor(reader=...)"| TM
         PERSIST -.->|reconstructs| PL
     end
 
@@ -60,7 +64,12 @@ flowchart TB
         WD["sandbox_watchdog\n(thermal/memory/security watchdog)"]
         IC["integrity_check\n(SHA-256 + Ed25519 signing)"]
         CTZ["thermal_reader\n(real sysfs telemetry)"]
-        CTZ -.->|"type-compatible via\nmsp_thermal_reader_telemetry_fn,\nbut no daemon entry point\nplugs it in by default yet"| WD
+        TS["telemetry_server\n(Unix-socket telemetry bridge)"]
+        MAIN["watchdogd_main\n(standalone daemon entry point)"]
+        CTZ ==>|"msp_thermal_reader_telemetry_fn"| WD
+        CTZ ==>|"same reader fn"| TS
+        MAIN ==>|"spawns + re-arms"| WD
+        MAIN ==>|"spawns"| TS
     end
 
     subgraph CUDA["src/cuda/  (compiles on real GPU, numerically UNVALIDATED)"]
@@ -69,7 +78,8 @@ flowchart TB
 
     AM ==>|"WIRED: real allocate/evict\ncalls on every load/unload"| NATIVE
     NATIVE ==>|pybind11| EA
-    TM -.->|"NOT WIRED: no bindings call\nsandbox_watchdog from Python"| WD
+    WTR ==>|"WIRED: Unix domain socket\n(one query = one fresh reading)"| TS
+    TM -.->|"NOT WIRED: Python still can't\ndirectly arm/observe sandbox_watchdog's\nfallback signal -- only share its\ntelemetry source (via WTR/TS above)"| WD
     PL -.->|"NOT WIRED: kernel is not called\nfrom the Python training loop"| KERNEL
     IC -.->|"NOT WIRED: no adapter-loading code\npath calls this yet"| PL
 
@@ -89,13 +99,25 @@ is optional and gracefully degrades: if the extension hasn't been built
 to its original pure-Python byte-tracking behavior automatically — check
 `AdapterManager.native_backed` to see which mode you're in.
 
-Still not wired: `ThermalMonitor` (Python) and `sandbox_watchdog` (C)
-remain two independent pluggable-reader systems that don't share a data
-source, even though the C side now has a real reader
-(`thermal_reader.c`) that's a drop-in fit for `msp_watchdog_config_t`'s
-`read_telemetry` field — no daemon entry point actually constructs one
-with it by default yet. The CUDA kernel is also not called from the
-Python training loop. See "What's left to do" below.
+Now wired: `watchdogd` (`src/daemon/watchdogd_main.c`) is a real,
+standalone daemon `main()` that constructs a `msp_watchdog_config_t` with
+`thermal_reader.c`'s reader, runs it against `sandbox_watchdog.c`, and
+also serves that exact same reading over a Unix domain socket
+(`telemetry_server.c`) to any client. `ThermalMonitor` (Python) and the
+watchdog no longer have to be two independent readers hoping to agree:
+`WatchdogTelemetryReader` (`src/python/msp/thermal.py`) queries that
+socket and can be passed straight into `ThermalMonitor(reader=...)`, so
+both languages can watch the one real telemetry source the watchdog
+itself is acting on.
+
+Still not wired: this closes the *telemetry* gap, not a *control* gap —
+Python still has no way to directly arm or observe
+`sandbox_watchdog`'s own fallback signal (`MSP_ARM_FALLBACK_POINT()`/
+`MSP_FALLBACK_SIGNAL` are C-side-only primitives); a Python inference
+process wanting the same rollback guarantee would need its own C
+extension or subprocess boundary to use them, which is a bigger, separate
+piece of work (see "What's left to do" below). The CUDA kernel is also
+still not called from the Python training loop.
 
 ## What's done
 
@@ -183,6 +205,30 @@ Python training loop. See "What's left to do" below.
   tab -- the runner image, available system packages, or network access
   could still differ in some way this reproduction didn't -- but it's a
   much stronger signal than "the YAML looks right."
+- **Standalone watchdog daemon and shared telemetry source**
+  (`src/daemon/watchdogd_main.c`, `src/daemon/telemetry_server.{h,c}`,
+  `src/python/msp/thermal.py`'s `WatchdogTelemetryReader`): the daemon
+  entry point that was missing (see the previous version of this file's
+  "what's left to do" item 2) now exists. `watchdogd` wires
+  `thermal_reader.c` into `sandbox_watchdog.c` for real, correctly
+  re-arming (`MSP_ARM_FALLBACK_POINT()`) and resuming after a fallback
+  rather than triggering once and stopping, and serves that same reading
+  over a Unix domain socket so Python (`WatchdogTelemetryReader`, usable
+  directly as `ThermalMonitor(reader=...)`) can watch the identical
+  telemetry source the watchdog itself acts on, instead of a second,
+  independent read of `/sys/class/thermal` that could in principle
+  disagree. 3 ctest cases for `telemetry_server.c` in isolation (clean
+  under ASan+UBSan too), plus 2 pytest cases
+  (`test_watchdogd_integration_*`) that spawn the real compiled
+  `watchdogd` binary against a simulated sysfs tree and query it over the
+  actual socket — skipped, not failed, if the binary isn't built, same
+  convention as the native-binding tests. Note: no current CI job both
+  builds the C/daemon layer *and* runs pytest in the same job (see
+  `ci.yml`), so — like the CUDA kernel's compile check — these two
+  integration tests are currently verified by local build+run only, not
+  by an actual GitHub Actions job; they're written to skip cleanly rather
+  than silently pass 0 cases if a future CI job doesn't build `watchdogd`
+  first.
 - **Documentation**: this file, `ARCHITECTURE.md` (what was fixed and
   why), `SECURITY.md` (honest threat-model statement).
 
@@ -236,18 +282,16 @@ them:
    thermal-gated code paths. It has not been run against a GPU yet — that
    run is the actual remaining step. See "CUDA validation on Google
    Colab" below for exact commands.
-2. **Wire `thermal_reader.c` into an actual watchdog entry point, and
-   `ThermalMonitor` to it in turn.** The C-side reader now exists and is
-   proven type-compatible with `msp_watchdog_config_t.read_telemetry`
-   (see the architecture diagram), but nothing actually constructs a
-   `msp_watchdog_config_t` with it outside of tests -- there's no
-   standalone daemon `main()` yet. Once there is, the remaining gap is
-   Python's `ThermalMonitor` and the C daemon still being two independent
-   pluggable-reader systems that don't share a data source; closing that
-   likely means exposing the daemon's telemetry (e.g. via a small
-   pybind11 binding or a shared-memory/socket handoff) back to Python,
-   not just having both languages read `/sys/class/thermal` independently
-   and hope they agree.
+2. **Give Python a way to participate in `sandbox_watchdog`'s own
+   fallback/control signal, not just its telemetry.** `watchdogd` and
+   `WatchdogTelemetryReader` now share one real telemetry source between
+   C and Python (see "What's done"), but `MSP_ARM_FALLBACK_POINT()` /
+   `MSP_FALLBACK_SIGNAL` are still C-only primitives — a Python inference
+   process can *see* the same readings the watchdog sees, but can't yet
+   *arm* the same rollback guarantee for itself without going through a C
+   extension or a subprocess boundary of its own. Worth doing once there's
+   an actual Python inference loop to protect (see item 3 below) — no
+   point wiring a fallback mechanism to nothing.
 3. **End-to-end training example.** Everything here is unit-tested in
    isolation; there's no example wiring a `StructuralPluginLayer` into an
    actual multi-layer transformer block and running a real training loop
@@ -342,8 +386,9 @@ cmake -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 
-# Python (49 tests -- 5 of these specifically exercise the native binding
-# built just above; they're skipped, not failed, if you skip that step)
+# Python (51 tests -- 5 exercise the native binding, 2 exercise the real
+# watchdogd binary; all 7 are skipped, not failed, if you skip the C/C++
+# build step above, since both are built by it)
 PYTHONPATH=src/python python -m pytest tests/python -v
 
 # Same C/C++ tests, under AddressSanitizer + UndefinedBehaviorSanitizer

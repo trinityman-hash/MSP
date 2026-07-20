@@ -131,6 +131,111 @@ def test_linux_reader_skips_unreadable_zone_at_read_time(tmp_path):
     assert reader() == pytest.approx(50.0)  # falls back to the still-good zone
 
 
+# --- WatchdogTelemetryReader tests: exercises the real compiled
+# `watchdogd` binary (src/daemon/watchdogd_main.c) end-to-end -- C main()
+# -> thermal_reader.c -> telemetry_server.c -> socket -> this Python
+# client. Skipped if the binary hasn't been built, same pattern
+# test_adapter_manager.py uses for msp_native. ---
+
+import os
+import subprocess
+import time
+
+from msp.thermal import WatchdogTelemetryReader
+
+
+def _find_watchdogd():
+    override = os.environ.get("MSP_WATCHDOGD_BIN")
+    if override and os.path.isfile(override):
+        return override
+    for candidate in ("build/watchdogd", "build-asan/watchdogd"):
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+_WATCHDOGD_BIN = _find_watchdogd()
+_SKIP_REASON = (
+    "watchdogd binary not built -- run `cmake -B build && cmake --build build` "
+    "first (see CMakeLists.txt's watchdogd target), or set MSP_WATCHDOGD_BIN"
+)
+requires_watchdogd = pytest.mark.skipif(_WATCHDOGD_BIN is None, reason=_SKIP_REASON)
+
+
+def _wait_for_socket(path, timeout_s=5.0):
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if os.path.exists(path):
+            return True
+        time.sleep(0.02)
+    return False
+
+
+@requires_watchdogd
+def test_watchdogd_integration_serves_real_thermal_reading(tmp_path):
+    _make_fake_zone(tmp_path, 0, "cpu-thermal", 61500)  # 61.5C
+    socket_path = tmp_path / "watchdogd.sock"
+
+    proc = subprocess.Popen(
+        [
+            _WATCHDOGD_BIN,
+            "--socket", str(socket_path),
+            "--thermal-base", str(tmp_path),
+        ],
+        stderr=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert _wait_for_socket(str(socket_path)), (
+            f"watchdogd never created its socket; stderr so far:\n"
+            f"{proc.stderr.read() if proc.poll() is not None else '(still running)'}"
+        )
+
+        reader = WatchdogTelemetryReader(socket_path=str(socket_path))
+        temp_c, sram_bytes, security_violation = reader.read_full()
+        assert temp_c == pytest.approx(61.5, abs=1e-2)
+        assert sram_bytes == 0  # thermal reader only ever fills temperature
+        assert security_violation is False
+
+        monitor = ThermalMonitor(reader=reader, freeze_threshold_c=75.0)
+        assert monitor.is_throttling() is False  # 61.5C is below threshold
+
+        # A second, independent query -- proves it's a live source, not a
+        # one-shot/cached response.
+        temp_c_again, _, _ = reader.read_full()
+        assert temp_c_again == pytest.approx(61.5, abs=1e-2)
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5.0)
+
+
+@requires_watchdogd
+def test_watchdogd_integration_removes_socket_on_graceful_shutdown(tmp_path):
+    _make_fake_zone(tmp_path, 0, "cpu-thermal", 40000)
+    socket_path = tmp_path / "watchdogd.sock"
+
+    proc = subprocess.Popen(
+        [_WATCHDOGD_BIN, "--socket", str(socket_path), "--thermal-base", str(tmp_path)],
+        stderr=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert _wait_for_socket(str(socket_path))
+        proc.terminate()  # SIGTERM -- watchdogd's installed graceful-shutdown handler
+        assert proc.wait(timeout=5.0) == 0
+        assert not socket_path.exists()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5.0)
+
+
 def test_linux_reader_integrates_with_thermal_monitor(tmp_path):
     """End-to-end: a real (simulated) hardware reader driving
     ThermalMonitor's throttling decision, not just a ScriptedThermalReader."""

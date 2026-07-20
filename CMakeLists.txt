@@ -70,9 +70,19 @@ add_library(msp_daemon STATIC
     src/daemon/sandbox_watchdog.c
     src/daemon/integrity_check.c
     src/daemon/thermal_reader.c
+    src/daemon/telemetry_server.c
 )
 target_include_directories(msp_daemon PUBLIC src/daemon)
 target_link_libraries(msp_daemon PUBLIC OpenSSL::Crypto Threads::Threads)
+
+# ---------------------------------------------------------------------------
+# watchdogd: the standalone daemon entry point wiring thermal_reader.c into
+# sandbox_watchdog.c and exposing telemetry to clients (e.g. Python's
+# msp.thermal.WatchdogTelemetryReader) over a Unix domain socket. See
+# watchdogd_main.c's own header comment for the full picture.
+# ---------------------------------------------------------------------------
+add_executable(watchdogd src/daemon/watchdogd_main.c)
+target_link_libraries(watchdogd PRIVATE msp_daemon)
 
 # ---------------------------------------------------------------------------
 # Tests (plain executables, no external test framework required)
@@ -95,4 +105,8 @@ if(MSP_BUILD_TESTS)
     add_executable(test_thermal_reader tests/daemon/test_thermal_reader.c)
     target_link_libraries(test_thermal_reader PRIVATE msp_daemon)
     add_test(NAME test_thermal_reader COMMAND test_thermal_reader)
+
+    add_executable(test_telemetry_server tests/daemon/test_telemetry_server.c)
+    target_link_libraries(test_telemetry_server PRIVATE msp_daemon)
+    add_test(NAME test_telemetry_server COMMAND test_telemetry_server)
 endif()
