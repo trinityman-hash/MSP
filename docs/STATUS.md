@@ -1,4 +1,4 @@
-# MSP Project Status & Architecture Map
+"# MSP Project Status & Architecture Map
 
 Read this first if you're new to the repo. It answers two questions:
 "what actually works right now" and "how do the pieces fit together."
@@ -22,7 +22,7 @@ model, see [`SECURITY.md`](SECURITY.md).
 | `telemetry_server` (C, Unix-socket telemetry bridge) | Done | 3 cases via ctest | Serves one fresh reading per connection over a Unix domain socket, via the same reader `watchdogd`'s watchdog thread uses -- the shared data source closing the Python/C reader-agreement gap |
 | `watchdogd` (C, standalone daemon `main()`) | Done | 2 pytest cases (`test_watchdogd_integration_*`) spawning the real compiled binary against a simulated sysfs tree; skipped, not failed, if the binary isn't built (same convention as the native-binding tests) | Wires `thermal_reader.c` into `sandbox_watchdog.c` and `telemetry_server.c`; re-arms and resumes after a fallback per `MSP_ARM_FALLBACK_POINT()`'s documented contract |
 | `integrity_check` (C, SHA-256 + Ed25519) | Done | Known-answer + tamper + signature round-trip tests | Signing primitive done; trust-root distribution still a deployment decision |
-| CUDA kernel | Compiles clean on real GPU; **numerically unvalidated** | `nvcc` build on a Colab T4 (exit 0, 2026-07-17) + manual code review | Builds, but its output has not yet been diffed against the PyTorch reference — the wrapper to do that now exists (`tests/cuda/validate_gradient_kernel.py`) but hasn't been run on a GPU yet. See "CUDA validation on Google Colab" below |
+| CUDA kernel | **Done — numerically validated on real GPU** | `nvcc` build on a Colab T4 (exit 0, 2026-07-17); numerically validated via `tests/cuda/validate_gradient_kernel.py` on a Colab T4 (2026-07-20) — PASS | Unthrottled path matches the PyTorch reference exactly; with throttling engaged, active rows match and frozen rows are confirmed untouched (sentinel check). See "CUDA validation on Google Colab" below for the captured output |
 | ONNX -> TVM/LLVM pipeline | **Not started** | — | Needed for the real cross-platform story (see below) |
 | B2B marketplace / SDK / registry | **Not started** | — | This is Phase 3 in the v2 doc; nothing here yet |
 | CI running on GitHub | **Verified against a faithful local reproduction** | Full `cmake`+`ctest`+`pytest` run, matching each of the 3 workflow jobs' exact commands/flags, 2026-07-18 | A real compile bug was caught and fixed this way before it could land as a broken build (see "Bugs found while continuing this work"). Not the same as watching a green checkmark on the Actions tab itself — see note below |
@@ -72,7 +72,7 @@ flowchart TB
         MAIN ==>|"spawns"| TS
     end
 
-    subgraph CUDA["src/cuda/  (compiles on real GPU, numerically UNVALIDATED)"]
+    subgraph CUDA["src/cuda/  (compiles AND numerically validated on real GPU)"]
         KERNEL["fused_msp_backward_kernel\n(thermal-gated gradient compute)"]
     end
 
@@ -182,15 +182,22 @@ still not called from the Python training loop.
   `pyproject.toml` for the Python package, a GitHub Actions workflow
   covering both (CPU-only — the CUDA path is explicitly out of scope for
   CI, since no GPU runner is configured).
-- **CUDA kernel compiles on real hardware**: `fused_msp_backward_kernel.cu`
-  was built with `nvcc` on a Colab T4 GPU on 2026-07-17 (`-arch=sm_75`,
-  exit code 0 — only pre-existing, harmless `-Wcomment` warnings about the
-  file's own multi-line build-instructions comment). This confirms the
-  kernel is syntactically valid CUDA and targets the right compute
-  capability; it does **not** confirm the kernel's math or its
-  thermal-gating logic are correct — see "CUDA validation on Google
-  Colab" below for what's still missing and `tests/cuda/validate_gradient_kernel.py`
-  for the wrapper that closes that gap once it's actually run.
+- **CUDA kernel compiles on real hardware and is numerically validated**:
+  `fused_msp_backward_kernel.cu` was built with `nvcc` on a Colab T4 GPU
+  on 2026-07-17 (`-arch=sm_75`, exit code 0 — only pre-existing, harmless
+  `-Wcomment` warnings about the file's own multi-line build-instructions
+  comment), confirming it's syntactically valid CUDA targeting the right
+  compute capability. On 2026-07-20, `tests/cuda/validate_gradient_kernel.py`
+  was actually run on a Colab T4: it compiles the kernel a second time via
+  NVRTC (through `cupy`, independent of the `nvcc` build above), runs it
+  against a fixed input (batch=4, in_features=16, rank=4), and diffs the
+  result element-by-element against `StructuralPluginLayer`'s own PyTorch
+  autograd gradient. Result: **PASS**. The unthrottled path matches the
+  reference exactly; with throttling engaged, the active rows still match
+  and the frozen rows are confirmed completely untouched (a sentinel value
+  pre-fills `grad_A` before launch specifically so a stray write would be
+  caught, not just a near-miss). Captured output is in "CUDA validation on
+  Google Colab" below.
 - **CI verified against a faithful local reproduction**: rather than
   trusting the workflow file's own internal consistency, every one of
   `ci.yml`'s 3 jobs was reproduced locally with the exact same
@@ -268,21 +275,14 @@ implementation, beyond the ones in `ARCHITECTURE.md`:
 
 ## What's left to do
 
-Roughly in the order a next contributor would probably want to tackle
-them:
+~~Numerically validate the CUDA kernel on real hardware~~ — **done as of
+2026-07-20**, see "CUDA validation on Google Colab" below for the captured
+PASS output.
 
-1. **Numerically validate the CUDA kernel on real hardware.** The kernel
-   now compiles cleanly on a real T4 (confirmed 2026-07-17 via Colab —
-   see the table above), which only proves it's syntactically valid CUDA
-   for the right compute capability. It has NOT yet been run and checked
-   for correctness. `tests/cuda/validate_gradient_kernel.py` is written
-   and ready — it compiles the kernel via NVRTC (through `cupy`, no
-   separate nvcc/ctypes link step needed) and diffs its output against a
-   trusted PyTorch autograd reference, for both the unthrottled and
-   thermal-gated code paths. It has not been run against a GPU yet — that
-   run is the actual remaining step. See "CUDA validation on Google
-   Colab" below for exact commands.
-2. **Give Python a way to participate in `sandbox_watchdog`'s own
+Roughly in the order a next contributor would probably want to tackle the
+rest:
+
+1. **Give Python a way to participate in `sandbox_watchdog`'s own
    fallback/control signal, not just its telemetry.** `watchdogd` and
    `WatchdogTelemetryReader` now share one real telemetry source between
    C and Python (see "What's done"), but `MSP_ARM_FALLBACK_POINT()` /
@@ -290,41 +290,59 @@ them:
    process can *see* the same readings the watchdog sees, but can't yet
    *arm* the same rollback guarantee for itself without going through a C
    extension or a subprocess boundary of its own. Worth doing once there's
-   an actual Python inference loop to protect (see item 3 below) — no
+   an actual Python inference loop to protect (see item 2 below) — no
    point wiring a fallback mechanism to nothing.
-3. **End-to-end training example.** Everything here is unit-tested in
+2. **End-to-end training example.** Everything here is unit-tested in
    isolation; there's no example wiring a `StructuralPluginLayer` into an
    actual multi-layer transformer block and running a real training loop
-   against it.
-4. **Trust-root decision for signature verification.** The cryptographic
+   against it. This would also give the CUDA kernel (now numerically
+   validated in isolation) something real to be wired into.
+3. **Trust-root decision for signature verification.** The cryptographic
    primitive is done (`msp_verify_signature`, Ed25519, tested) — what's
    left is a deployment decision about where a verifier gets a public key
    it should trust (embedded key vs. certificate chain vs. attestation
    service) and how revocation works. See `SECURITY.md`.
-5. **The ONNX -> Apache TVM/LLVM cross-platform pipeline.** This is the
+4. **The ONNX -> Apache TVM/LLVM cross-platform pipeline.** This is the
    architecturally-sound way (per the v2 design doc) to actually deploy
    across Apple AMX / Qualcomm Hexagon / etc. Nothing toward this exists
    yet; it needs the TVM toolchain and vendor SDKs.
-6. **B2B marketplace SDK / adapter registry.** Phase 3 in the v2 doc's
+5. **B2B marketplace SDK / adapter registry.** Phase 3 in the v2 doc's
    roadmap. Not started — arguably shouldn't be, until the steps above
    give you something worth registering.
-7. **Housekeeping:** pick a `LICENSE`, watch an actual GitHub Actions run
-   go green on GitHub's own infrastructure (everything so far has been
-   verified via a faithful *local* reproduction of the same commands --
-   see the CI row in the table above for what that does and doesn't
-   guarantee), and decide on a versioning/release process once there's a
-   first real consumer of this package.
+6. **Housekeeping:** pick a `LICENSE` (still not chosen — the repo is
+   public but, without a license file, not technically open source),
+   watch an actual GitHub Actions run go green on GitHub's own
+   infrastructure (everything so far has been verified via a faithful
+   *local* reproduction of the same commands -- see the CI row in the
+   table above for what that does and doesn't guarantee), and decide on a
+   versioning/release process once there's a first real consumer of this
+   package.
 
 ## CUDA validation on Google Colab
 
-`src/cuda/fused_msp_backward_kernel.cu` compiles cleanly on real NVIDIA
-hardware (confirmed 2026-07-17 on a Colab T4 — `nvcc`, exit code 0), but
-its output has never been checked against a trusted reference. Compiling
-only proves the syntax and compute-capability targeting are right; it
-says nothing about whether the math or the thermal-gating logic actually
-does what the comments say. Exact process, updated now that steps 1-4
-have already been done once (repeat them for a fresh Colab session; a
-runtime doesn't persist between sessions):
+**Status: validated.** `src/cuda/fused_msp_backward_kernel.cu` compiles
+cleanly on real NVIDIA hardware (confirmed 2026-07-17 on a Colab T4 —
+`nvcc`, exit code 0), and as of 2026-07-20 its output has actually been
+checked against a trusted reference via `tests/cuda/validate_gradient_kernel.py`,
+run on a Colab T4. Captured output from that run:
+
+```
+Reading kernel from src/cuda/fused_msp_backward_kernel.cu
+GPU: Tesla T4
+Kernel compiled via NVRTC OK.
+[no throttling]  matches PyTorch autograd reference: True
+[throttling]     active rows [0, 2] match reference: True
+[throttling]     frozen rows [1, 3] left untouched (sentinel intact): True
+
+PASS: fused_msp_backward_kernel.cu matches the PyTorch reference (both throttled and unthrottled), on real GPU hardware.
+```
+
+This confirms the kernel's math and its thermal-gating logic are correct
+against the same reference the Python layer itself is checked against —
+not just that the file compiles. The steps below are the exact recipe
+that produced this result, kept here as-is so the run can be reproduced
+(e.g. after any future change to the kernel, or in a fresh Colab session
+— a runtime doesn't persist between sessions):
 
 1. Go to **colab.research.google.com** → **New notebook**.
 2. **Runtime → Change runtime type → T4 GPU → Save.**
@@ -348,8 +366,8 @@ runtime doesn't persist between sessions):
    `sm_80` example in the file's own header comment, which assumed an
    A100-class card.) This step alone only proves it compiles, not that
    it's correct — step 5 is the one that actually matters.
-5. **Run the numeric validation.** This is the step that was previously
-   missing and is now the concrete next action:
+5. **Run the numeric validation.** This is the step that produced the
+   captured PASS output above:
    ```python
    !pip install -q cupy-cuda12x
    !python tests/cuda/validate_gradient_kernel.py
@@ -400,12 +418,14 @@ cmake --build build-asan -j
 ctest --test-dir build-asan --output-on-failure
 ```
 
-Nothing in the two commands above touches `src/cuda/` — there is
-currently no way to validate it without NVIDIA GPU hardware, which is why
-it has its own separate section above. On a machine that does have a
-CUDA-capable GPU and toolkit (Colab or otherwise):
+Nothing in the two commands above touches `src/cuda/` — validating it
+needs NVIDIA GPU hardware, which is why it has its own separate section
+above (already run successfully once, 2026-07-20 — see the captured
+output there). On a machine that does have a CUDA-capable GPU and
+toolkit (Colab or otherwise), to re-run it yourself:
 
 ```bash
 pip install cupy-cuda12x  # or cupy-cuda13x, matching your toolkit
 python tests/cuda/validate_gradient_kernel.py
 ```
+"
