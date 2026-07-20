@@ -148,14 +148,15 @@ This repo's `StructuralPluginLayer` matches that initialization and adds
   tests, pytest), the C++ allocator and C daemon/integrity-check code
   (built and tested via CMake/ctest, and re-run clean under
   AddressSanitizer + UndefinedBehaviorSanitizer).
-- **Not verified here (no GPU/toolchain in this environment):** the CUDA
-  kernel (`src/cuda/`) — reviewed for correctness and syntax, balanced
-  braces/parens checked mechanically, but not compiled or executed. The
-  TVM/ONNX cross-platform pipeline described in section 3.2 of the v2 doc
-  is not implemented at all. Before trusting the CUDA kernel, compile it
-  and cross-check its output against `StructuralPluginLayer`'s PyTorch
-  autograd gradient on a small fixed input — see the caveat comment at the
-  top of `fused_msp_backward_kernel.cu` for the exact recipe.
+- **Verified on real GPU hardware, outside this environment (no GPU
+  here):** the CUDA kernel (`src/cuda/`) — reviewed for correctness and
+  syntax, then compiled with `nvcc` on a Colab T4 (2026-07-17) and
+  numerically cross-checked against `StructuralPluginLayer`'s PyTorch
+  autograd gradient via `tests/cuda/validate_gradient_kernel.py`
+  (2026-07-20), both with thermal throttling on and off. See
+  `docs/STATUS.md`'s "CUDA validation on Google Colab" section for the
+  exact recipe and captured output. The TVM/ONNX cross-platform pipeline
+  described in section 3.2 of the v2 doc is still not implemented at all.
 
 For a status table and a diagram of which subsystems are (and are not)
 actually wired together, see [`STATUS.md`](STATUS.md).

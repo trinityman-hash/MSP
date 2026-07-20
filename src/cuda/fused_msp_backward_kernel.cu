@@ -36,18 +36,27 @@
 //    This file is explicitly the CUDA/NVIDIA backend only.
 //
 // -----------------------------------------------------------------------
-// IMPORTANT CAVEAT -- READ BEFORE TRUSTING THIS FILE
+// VALIDATION STATUS
 // -----------------------------------------------------------------------
-// This kernel has been reviewed for correct CUDA syntax and indexing, but
-// it has NOT been compiled or executed: the sandbox this project was
-// built in has no NVIDIA GPU and no nvcc toolchain available. Before
-// relying on this in production:
-//   1. Compile it (see the nvcc command at the bottom of this file).
-//   2. Cross-check its output against the pure-PyTorch autograd gradient
-//      for a small, fixed input (e.g. batch=4, in_features=16, rank=4) --
-//      msp.plugin_layer.StructuralPluginLayer's normal backward() pass
-//      gives you a trusted reference value to diff against.
-//   3. Only then treat it as validated.
+// The sandbox this project was built in has no NVIDIA GPU or nvcc
+// toolchain, so this kernel could not be compiled or run there. It has
+// since been validated on real GPU hardware (Colab T4):
+//   1. Compiled with nvcc, -arch=sm_75, 2026-07-17 (exit 0; only
+//      pre-existing, harmless -Wcomment warnings from this file's own
+//      multi-line build-instructions comment below).
+//   2. Numerically cross-checked, 2026-07-20, via
+//      tests/cuda/validate_gradient_kernel.py (compiles a second time
+//      through NVRTC/cupy, independent of step 1's nvcc build) against
+//      msp.plugin_layer.StructuralPluginLayer's PyTorch autograd
+//      gradient for a fixed input (batch=4, in_features=16, rank=4):
+//      output matches with thermal throttling off, and with throttling
+//      on (freeze_stride=2) the active rows match exactly while the
+//      frozen rows are left provably untouched (checked via a sentinel
+//      value, not just "close to zero").
+// Both steps passed. See docs/STATUS.md's "CUDA validation on Google
+// Colab" section for the exact recipe and captured output -- re-run it
+// if this file changes, since a passing result only covers the exact
+// code that was checked in at the time it was run.
 //
 // Known limitation: this is a naive one-thread-per-output-element kernel
 // with a serial loop over the batch dimension -- correct, but not

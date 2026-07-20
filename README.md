@@ -91,14 +91,16 @@ cmake -B build -DMSP_USE_CUDA=ON
   daemon/integrity-check code (Ed25519 signing included) — built and
   tested via CMake/ctest, and re-run clean under AddressSanitizer +
   UndefinedBehaviorSanitizer.
-- **Not verified here:** `src/cuda/fused_msp_backward_kernel.cu` — this
-  development environment has no NVIDIA GPU or CUDA toolkit. The kernel
-  has been reviewed for correctness and syntax but not compiled or
-  executed. See the caveat comment at the top of that file for the exact
-  validation recipe before trusting it in production. The ONNX → Apache
-  TVM/LLVM cross-platform compilation pipeline described in the v2 design
-  doc is not implemented at all — it needs the TVM toolchain and vendor
-  SDKs (Xcode, Qualcomm Hexagon SDK) that aren't available here.
+- **Verified on real GPU hardware, separately:**
+  `src/cuda/fused_msp_backward_kernel.cu` — this development environment
+  has no NVIDIA GPU or CUDA toolkit, but the kernel has been compiled
+  with `nvcc` and numerically validated against the PyTorch autograd
+  reference on a Colab T4 GPU, both with thermal throttling on and off
+  (see [`docs/STATUS.md`](docs/STATUS.md)'s "CUDA validation on Google
+  Colab" section for the exact recipe and captured output). The ONNX →
+  Apache TVM/LLVM cross-platform compilation pipeline described in the v2
+  design doc is not implemented at all — it needs the TVM toolchain and
+  vendor SDKs (Xcode, Qualcomm Hexagon SDK) that aren't available here.
 
 See [`docs/STATUS.md`](docs/STATUS.md) for the full, itemized breakdown of
 what's done vs. left to do, and how the pieces (do and don't) connect.
