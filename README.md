@@ -30,6 +30,7 @@ src/cuda/           NVIDIA CUDA kernel for on-device gradient compute.
 src/daemon/         C watchdog + SHA-256/Ed25519 integrity-check daemon.
 tests/              Mirrors src/. Python via pytest; C/C++ via plain
                     executables run through ctest.
+examples/           Runnable, end-to-end usage examples (see below).
 docs/               Architecture, status, and security notes.
 ```
 
@@ -59,6 +60,16 @@ mgr.unload_adapter("legal-taxonomy-v1")
 # Thermal-aware gradient gating during training:
 monitor = ThermalMonitor(freeze_threshold_c=75.0, freeze_ratio=0.2)
 layer.gate_gradients(monitor)
+```
+
+The snippet above shows each piece on its own. For all of them wired
+together — a real multi-layer transformer, two independently-trained
+adapters hot-swapped over one frozen base, memory-budget enforcement,
+thermal-gated fine-tuning, and a save/reload round trip — see
+[`examples/e2e_training.py`](examples/e2e_training.py):
+
+```bash
+PYTHONPATH=src/python python examples/e2e_training.py
 ```
 
 ## Quickstart — C/C++/daemon layer
