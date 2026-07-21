@@ -13,6 +13,7 @@ from .plugin_layer import StructuralPluginLayer
 from .adapter_manager import AdapterManager, AdapterBudgetError
 from .thermal import ThermalMonitor, ThermalReading
 from .persistence import save_adapter, load_adapter
+from .watchdog_control import WatchdogGuardedExecutor, ProtectedRunResult
 
 __all__ = [
     "StructuralPluginLayer",
@@ -22,6 +23,8 @@ __all__ = [
     "ThermalReading",
     "save_adapter",
     "load_adapter",
+    "WatchdogGuardedExecutor",
+    "ProtectedRunResult",
 ]
 
 __version__ = "0.1.0"
