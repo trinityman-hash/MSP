@@ -23,6 +23,7 @@ model, see [`SECURITY.md`](SECURITY.md).
 | `watchdogd` (C, standalone daemon `main()`) | Done | 2 pytest cases (`test_watchdogd_integration_*`) spawning the real compiled binary against a simulated sysfs tree; skipped, not failed, if the binary isn't built (same convention as the native-binding tests) | Wires `thermal_reader.c` into `sandbox_watchdog.c` and `telemetry_server.c`; re-arms and resumes after a fallback per `MSP_ARM_FALLBACK_POINT()`'s documented contract |
 | `integrity_check` (C, SHA-256 + Ed25519) | Done | Known-answer + tamper + signature round-trip tests | Signing primitive done; trust-root distribution still a deployment decision |
 | CUDA kernel | **Done — numerically validated on real GPU** | `nvcc` build on a Colab T4 (exit 0, 2026-07-17); numerically validated via `tests/cuda/validate_gradient_kernel.py` on a Colab T4 (2026-07-20) — PASS | Unthrottled path matches the PyTorch reference exactly; with throttling engaged, active rows match and frozen rows are confirmed untouched (sentinel check). See "CUDA validation on Google Colab" below for the captured output |
+| End-to-end training example (`examples/e2e_training.py`) | **Done** | 8 pytest cases (`tests/python/test_e2e_training_example.py`) | Real multi-layer transformer, two adapters hot-swapped over one frozen base via `AdapterManager`, budget enforcement sized from real `parameter_bytes()`, thermal-gated fine-tuning, and a `msp.persistence` save/reload round trip, all exercised together instead of one piece at a time |
 | ONNX -> TVM/LLVM pipeline | **Not started** | — | Needed for the real cross-platform story (see below) |
 | B2B marketplace / SDK / registry | **Not started** | — | This is Phase 3 in the v2 doc; nothing here yet |
 | CI running on GitHub | **Verified against a faithful local reproduction** | Full `cmake`+`ctest`+`pytest` run, matching each of the 3 workflow jobs' exact commands/flags, 2026-07-18 | A real compile bug was caught and fixed this way before it could land as a broken build (see "Bugs found while continuing this work"). Not the same as watching a green checkmark on the Actions tab itself — see note below |
@@ -236,6 +237,31 @@ still not called from the Python training loop.
   by an actual GitHub Actions job; they're written to skip cleanly rather
   than silently pass 0 cases if a future CI job doesn't build `watchdogd`
   first.
+- **End-to-end training example** (`examples/e2e_training.py`): the
+  integration gap the previous version of this file's "what's left to
+  do" item #2 flagged — every `msp` component was unit-tested in
+  isolation, but nothing wired a `StructuralPluginLayer` into an actual
+  multi-layer transformer block and ran a real training loop against it.
+  This example builds a small real transformer (multi-head self-attention
+  + feed-forward blocks, standard pre-LN residual structure) with a
+  frozen base, attaches two independent rank-8 adapters to the same base
+  layers, and exercises the full lifecycle for real: trains each adapter
+  with a genuine forward/backward/`optimizer.step()` loop (loss goes from
+  ~2.8, near the `ln(vocab_size)` random-guess baseline, to <1e-5),
+  enforces `AdapterManager`'s memory budget using the adapters' own
+  measured `parameter_bytes()` (not a synthetic number) so the second
+  adapter is genuinely rejected until the first is evicted, gates
+  gradients through a simulated hot spell via `ThermalMonitor` across the
+  whole model rather than a single isolated layer, and round-trips one
+  adapter through `msp.persistence.save_adapter`/`load_adapter` with a
+  bit-for-bit output check afterward. 8 pytest cases in
+  `tests/python/test_e2e_training_example.py`, including a regression
+  check that training never touches the frozen base's parameters (a bug
+  the per-layer unit tests couldn't have caught, since none of them
+  build a composed model with other trainable-looking parameters
+  nearby). Does not wire in the CUDA kernel or `sandbox_watchdog`'s
+  control signal — see "what's left to do" below; this only gives them
+  something real to eventually plug into on the Python side.
 - **Documentation**: this file, `ARCHITECTURE.md` (what was fixed and
   why), `SECURITY.md` (honest threat-model statement).
 
@@ -272,12 +298,29 @@ implementation, beyond the ones in `ARCHITECTURE.md`:
   flags (`-std=gnu11`, no extra defines) rather than trusting the earlier
   ad-hoc testing, and fixed with `#define _XOPEN_SOURCE 700` at the top
   of the file, before its first `#include`.
+- **Missing `numpy` dependency**: `pip install -r requirements.txt`
+  followed by this file's own documented `pytest` command
+  (`PYTHONPATH=src/python python -m pytest tests/python -v`) failed with
+  `ModuleNotFoundError: No module named 'numpy'` on a genuinely fresh
+  virtualenv — `safetensors.torch`'s `save_file`/`load_file` import numpy
+  internally (to convert a tensor to an ndarray view) but neither
+  `requirements.txt` nor `pyproject.toml`'s `dependencies` ever declared
+  it, so it only worked in environments that happened to have numpy
+  installed for some unrelated reason. Reproduced by installing exactly
+  `requirements.txt` into a clean venv and nothing else; every
+  `tests/python/test_persistence.py` case failed until `numpy` was added
+  to both files. Since this affects `msp.persistence` at actual runtime
+  (not just in tests), it's listed in `pyproject.toml`'s core
+  `dependencies`, not only the `dev` extra.
 
 ## What's left to do
 
 ~~Numerically validate the CUDA kernel on real hardware~~ — **done as of
 2026-07-20**, see "CUDA validation on Google Colab" below for the captured
 PASS output.
+
+~~End-to-end training example~~ — **done as of 2026-07-21**, see
+`examples/e2e_training.py` and its "What's done" entry above.
 
 Roughly in the order a next contributor would probably want to tackle the
 rest:
@@ -289,14 +332,21 @@ rest:
    `MSP_FALLBACK_SIGNAL` are still C-only primitives — a Python inference
    process can *see* the same readings the watchdog sees, but can't yet
    *arm* the same rollback guarantee for itself without going through a C
-   extension or a subprocess boundary of its own. Worth doing once there's
-   an actual Python inference loop to protect (see item 2 below) — no
-   point wiring a fallback mechanism to nothing.
-2. **End-to-end training example.** Everything here is unit-tested in
-   isolation; there's no example wiring a `StructuralPluginLayer` into an
-   actual multi-layer transformer block and running a real training loop
-   against it. This would also give the CUDA kernel (now numerically
-   validated in isolation) something real to be wired into.
+   extension or a subprocess boundary of its own. `examples/e2e_training.py`
+   now gives this something concrete to protect (a real training loop
+   already reading thermal telemetry via `ThermalMonitor`), but note it's
+   a *training* loop, not the *inference*-serving loop this item is
+   really about — that distinction still matters for what "worth arming"
+   means here.
+2. **Wire the CUDA kernel into the Python training loop.**
+   `fused_msp_backward_kernel.cu` is numerically validated in isolation
+   (see "CUDA validation on Google Colab" below) but nothing calls it from
+   `examples/e2e_training.py` or anywhere else in the Python training
+   path yet — training there runs entirely through PyTorch autograd on
+   CPU. Wiring it in needs a custom autograd `Function` (forward calls
+   PyTorch as it does today; backward dispatches to the kernel when a
+   CUDA device is available) and, ideally, a GPU-capable CI runner to test
+   it automatically instead of only via the manual Colab recipe below.
 3. **Trust-root decision for signature verification.** The cryptographic
    primitive is done (`msp_verify_signature`, Ed25519, tested) — what's
    left is a deployment decision about where a verifier gets a public key
@@ -404,10 +454,15 @@ cmake -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 
-# Python (51 tests -- 5 exercise the native binding, 2 exercise the real
+# Python (59 tests -- 5 exercise the native binding, 2 exercise the real
 # watchdogd binary; all 7 are skipped, not failed, if you skip the C/C++
 # build step above, since both are built by it)
 PYTHONPATH=src/python python -m pytest tests/python -v
+
+# End-to-end example (trains two real adapters, saves/reloads one) --
+# not part of the pytest suite above, run separately since it's meant to
+# be read, not just asserted on:
+PYTHONPATH=src/python python examples/e2e_training.py
 
 # Same C/C++ tests, under AddressSanitizer + UndefinedBehaviorSanitizer
 cmake -B build-asan -DCMAKE_BUILD_TYPE=Debug -DMSP_BUILD_PYTHON_BINDINGS=OFF \
