@@ -24,6 +24,7 @@ model, see [`SECURITY.md`](SECURITY.md).
 | `integrity_check` (C, SHA-256 + Ed25519) | Done | Known-answer + tamper + signature round-trip tests | Signing primitive done; trust-root distribution still a deployment decision |
 | CUDA kernel | **Done — numerically validated on real GPU** | `nvcc` build on a Colab T4 (exit 0, 2026-07-17); numerically validated via `tests/cuda/validate_gradient_kernel.py` on a Colab T4 (2026-07-20) — PASS | Unthrottled path matches the PyTorch reference exactly; with throttling engaged, active rows match and frozen rows are confirmed untouched (sentinel check). See "CUDA validation on Google Colab" below for the captured output |
 | End-to-end training example (`examples/e2e_training.py`) | **Done** | 8 pytest cases (`tests/python/test_e2e_training_example.py`) | Real multi-layer transformer, two adapters hot-swapped over one frozen base via `AdapterManager`, budget enforcement sized from real `parameter_bytes()`, thermal-gated fine-tuning, and a `msp.persistence` save/reload round trip, all exercised together instead of one piece at a time |
+| `msp.watchdog_control` (Python fallback/control participation) | **Done** | 19 pytest cases (`tests/python/test_watchdog_control.py`), including a real-`watchdogd`-binary integration test and a SIGTERM-ignored-then-SIGKILLed escalation test | Process-boundary isolation (spawn + terminate), not a binding of `MSP_ARM_FALLBACK_POINT()` — see `watchdog_control.py`'s module docstring for why `siglongjmp()` through a live CPython stack would be unsafe |
 | ONNX -> TVM/LLVM pipeline | **Not started** | — | Needed for the real cross-platform story (see below) |
 | B2B marketplace / SDK / registry | **Not started** | — | This is Phase 3 in the v2 doc; nothing here yet |
 | CI running on GitHub | **Verified against a faithful local reproduction** | Full `cmake`+`ctest`+`pytest` run, matching each of the 3 workflow jobs' exact commands/flags, 2026-07-18 | A real compile bug was caught and fixed this way before it could land as a broken build (see "Bugs found while continuing this work"). Not the same as watching a green checkmark on the Actions tab itself — see note below |
@@ -111,14 +112,16 @@ socket and can be passed straight into `ThermalMonitor(reader=...)`, so
 both languages can watch the one real telemetry source the watchdog
 itself is acting on.
 
-Still not wired: this closes the *telemetry* gap, not a *control* gap —
-Python still has no way to directly arm or observe
-`sandbox_watchdog`'s own fallback signal (`MSP_ARM_FALLBACK_POINT()`/
-`MSP_FALLBACK_SIGNAL` are C-side-only primitives); a Python inference
-process wanting the same rollback guarantee would need its own C
-extension or subprocess boundary to use them, which is a bigger, separate
-piece of work (see "What's left to do" below). The CUDA kernel is also
-still not called from the Python training loop.
+That closed the *telemetry* gap, not the *control* gap — `MSP_ARM_FALLBACK_POINT()`/
+`MSP_FALLBACK_SIGNAL` are still C-side-only primitives, and no Python code
+directly arms or triggers them. `msp.watchdog_control.WatchdogGuardedExecutor`
+now gives Python callers an equivalent rollback guarantee through a
+different, Python-appropriate mechanism instead: the protected callable
+runs in a spawned child process, which is terminated (SIGTERM, escalating
+to SIGKILL) the moment a violation is observed — see that module's
+docstring for why directly binding the C macro's `siglongjmp()`-based
+approach would be unsafe to do across a live CPython stack. The CUDA
+kernel is still not called from the Python training loop.
 
 ## What's done
 
@@ -262,6 +265,29 @@ still not called from the Python training loop.
   nearby). Does not wire in the CUDA kernel or `sandbox_watchdog`'s
   control signal — see "what's left to do" below; this only gives them
   something real to eventually plug into on the Python side.
+- **Python participation in the watchdog's fallback/control signal**
+  (`src/python/msp/watchdog_control.py`): closes the *control* half of
+  the gap the "telemetry" wiring above only closed the read-only half of.
+  `WatchdogGuardedExecutor.run()` runs a callable in a spawned child
+  process and terminates it (SIGTERM, escalating to SIGKILL after a grace
+  period if the child ignores it) the instant a `ViolationPolicy` flags a
+  telemetry reading as a violation — a real, working rollback guarantee,
+  deliberately built as process-boundary isolation rather than a direct
+  binding of `MSP_ARM_FALLBACK_POINT()`/`MSP_FALLBACK_SIGNAL` (see the
+  module's docstring: `siglongjmp()` through a live, in-flight CPython
+  stack has no notion of reference counts, the GIL, or Python/C cleanup
+  for the frames it would discard — a strictly worse failure mode than
+  the violation it exists to protect against). `telemetry_probe_from_watchdog_socket()`
+  builds on `WatchdogTelemetryReader` so a violation here tracks the same
+  telemetry source `sandbox_watchdog.c` itself acts on, not a second,
+  independently-drifting policy. Fails closed on a broken telemetry probe
+  (mirroring `thermal_reader.c`'s own +INFINITY-on-failed-read choice).
+  19 pytest cases in `tests/python/test_watchdog_control.py`, including
+  one that spawns the real compiled `watchdogd` binary (skipped, not
+  failed, if it isn't built — same convention as the other
+  `watchdogd`-dependent tests) and one that verifies the SIGTERM ->
+  grace-period -> SIGKILL escalation actually happens against a child
+  that ignores SIGTERM.
 - **Documentation**: this file, `ARCHITECTURE.md` (what was fixed and
   why), `SECURITY.md` (honest threat-model statement).
 
@@ -312,6 +338,29 @@ implementation, beyond the ones in `ARCHITECTURE.md`:
   to both files. Since this affects `msp.persistence` at actual runtime
   (not just in tests), it's listed in `pyproject.toml`'s core
   `dependencies`, not only the `dev` extra.
+- **`multiprocessing.Queue.put()` pickles asynchronously**: the child
+  process in `WatchdogGuardedExecutor` originally called `result_queue.put(value)`
+  directly and assumed a `PicklingError` on an unpicklable return value
+  would surface to the caller. It doesn't — `Queue.put()` hands the object
+  to a background feeder thread that pickles it later, so the exception
+  was raised and silently swallowed inside that thread, and the parent
+  just saw the queue stay empty until its own timeout fired, misreporting
+  a pickling bug as a hang. Fixed by pickling the return value explicitly
+  and synchronously in the child, before it ever reaches `Queue.put()`, so
+  a `PicklingError` there surfaces immediately and honestly.
+- **`watchdogd`'s own fallback cycles its telemetry socket**: under a
+  sustained violation, `sandbox_watchdog.c`'s critical-fallback loop
+  (the same `MSP_CRITICAL_TEMP_C` constant `watchdog_control.py` mirrors)
+  cycles `telemetry_server.c` through fallback/cooldown along with
+  everything else it protects, so a client can observe the telemetry
+  socket become intermittently unavailable exactly when it matters most
+  -- discovered via a real-`watchdogd` integration test that queried the
+  socket continuously through a sustained-hot scenario and saw connection
+  refusals partway through, not a bug in the client. Not "fixed" (this is
+  correct, intentional behavior on the C side, not a defect) but now
+  explicitly documented in `telemetry_probe_from_watchdog_socket()`'s
+  docstring so a caller knows to treat a refused connection as a
+  `TELEMETRY_ERROR` violation (fail closed) rather than as a client bug.
 
 ## What's left to do
 
@@ -322,23 +371,19 @@ PASS output.
 ~~End-to-end training example~~ — **done as of 2026-07-21**, see
 `examples/e2e_training.py` and its "What's done" entry above.
 
+~~Give Python a way to participate in `sandbox_watchdog`'s own
+fallback/control signal~~ — **done as of 2026-07-21**, see
+`src/python/msp/watchdog_control.py` and its "What's done" entry above.
+Built as process-boundary isolation rather than a direct binding of
+`MSP_ARM_FALLBACK_POINT()` (unsafe across a live CPython stack — see the
+module's docstring); a next contributor revisiting this should read that
+reasoning before assuming a tighter binding is simply an unfinished
+version of the same thing.
+
 Roughly in the order a next contributor would probably want to tackle the
 rest:
 
-1. **Give Python a way to participate in `sandbox_watchdog`'s own
-   fallback/control signal, not just its telemetry.** `watchdogd` and
-   `WatchdogTelemetryReader` now share one real telemetry source between
-   C and Python (see "What's done"), but `MSP_ARM_FALLBACK_POINT()` /
-   `MSP_FALLBACK_SIGNAL` are still C-only primitives — a Python inference
-   process can *see* the same readings the watchdog sees, but can't yet
-   *arm* the same rollback guarantee for itself without going through a C
-   extension or a subprocess boundary of its own. `examples/e2e_training.py`
-   now gives this something concrete to protect (a real training loop
-   already reading thermal telemetry via `ThermalMonitor`), but note it's
-   a *training* loop, not the *inference*-serving loop this item is
-   really about — that distinction still matters for what "worth arming"
-   means here.
-2. **Wire the CUDA kernel into the Python training loop.**
+1. **Wire the CUDA kernel into the Python training loop.**
    `fused_msp_backward_kernel.cu` is numerically validated in isolation
    (see "CUDA validation on Google Colab" below) but nothing calls it from
    `examples/e2e_training.py` or anywhere else in the Python training
@@ -347,19 +392,19 @@ rest:
    PyTorch as it does today; backward dispatches to the kernel when a
    CUDA device is available) and, ideally, a GPU-capable CI runner to test
    it automatically instead of only via the manual Colab recipe below.
-3. **Trust-root decision for signature verification.** The cryptographic
+2. **Trust-root decision for signature verification.** The cryptographic
    primitive is done (`msp_verify_signature`, Ed25519, tested) — what's
    left is a deployment decision about where a verifier gets a public key
    it should trust (embedded key vs. certificate chain vs. attestation
    service) and how revocation works. See `SECURITY.md`.
-4. **The ONNX -> Apache TVM/LLVM cross-platform pipeline.** This is the
+3. **The ONNX -> Apache TVM/LLVM cross-platform pipeline.** This is the
    architecturally-sound way (per the v2 design doc) to actually deploy
    across Apple AMX / Qualcomm Hexagon / etc. Nothing toward this exists
    yet; it needs the TVM toolchain and vendor SDKs.
-5. **B2B marketplace SDK / adapter registry.** Phase 3 in the v2 doc's
+4. **B2B marketplace SDK / adapter registry.** Phase 3 in the v2 doc's
    roadmap. Not started — arguably shouldn't be, until the steps above
    give you something worth registering.
-6. **Housekeeping:** pick a `LICENSE` (still not chosen — the repo is
+5. **Housekeeping:** pick a `LICENSE` (still not chosen — the repo is
    public but, without a license file, not technically open source),
    watch an actual GitHub Actions run go green on GitHub's own
    infrastructure (everything so far has been verified via a faithful
@@ -454,9 +499,13 @@ cmake -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 
-# Python (59 tests -- 5 exercise the native binding, 2 exercise the real
-# watchdogd binary; all 7 are skipped, not failed, if you skip the C/C++
-# build step above, since both are built by it)
+# Python (78 tests -- 5 exercise the native binding, 3 exercise the real
+# watchdogd binary (2 in test_watchdogd_integration_*, 1 in
+# test_watchdog_control.py); all 8 are skipped, not failed, if you skip
+# the C/C++ build step above, since both are built by it. The
+# watchdog_control SIGTERM/SIGKILL escalation tests spawn real child
+# processes and wait out real grace periods, so this run takes noticeably
+# longer -- around 90s here -- than the rest of the suite alone would.)
 PYTHONPATH=src/python python -m pytest tests/python -v
 
 # End-to-end example (trains two real adapters, saves/reloads one) --
